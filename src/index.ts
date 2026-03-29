@@ -6,6 +6,7 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
+import { readFile } from 'node:fs/promises';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -945,6 +946,43 @@ const TOOLS = [
     },
   },
   {
+    name: 'code_task_files',
+    description:
+      'Send a code analysis task to the local LLM, reading source files from disk by path. ' +
+      'Identical to code_task but accepts file paths instead of raw code — the server reads the files itself, ' +
+      'so the content never enters Claude\'s context window.\n\n' +
+      'WHEN TO USE:\n' +
+      '• Any time you would use code_task but want to avoid loading file content into Claude\'s context.\n' +
+      '• Prefer this over code_task for all file-based analysis.\n\n' +
+      'GETTING BEST RESULTS:\n' +
+      '• Pass absolute file paths accessible on the host filesystem.\n' +
+      '• Be specific in the task: "Find slow database calls" beats "Review this".\n' +
+      '• Set the language field for better accuracy.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Absolute paths to source files to analyse. All files are concatenated and sent to the LLM.',
+        },
+        task: {
+          type: 'string',
+          description: 'What to do: "Find bugs", "Explain this", "Find slow database calls", "Write tests".',
+        },
+        language: {
+          type: 'string',
+          description: 'Programming language: "typescript", "python", "csharp", etc.',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Max response tokens. Default 2048.',
+        },
+      },
+      required: ['paths', 'task'],
+    },
+  },
+  {
     name: 'discover',
     description:
       'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
@@ -1166,6 +1204,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const codeFooter = formatFooter(codeResp, lang);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+      }
+
+      case 'code_task_files': {
+        const { paths, task: filesTask, language: filesLanguage, max_tokens: filesMaxTokens } = args as {
+          paths: string[];
+          task: string;
+          language?: string;
+          max_tokens?: number;
+        };
+
+        const fileContents = await Promise.all(
+          paths.map(async (p) => {
+            const content = await readFile(p, 'utf8');
+            return `// --- ${p} ---\n${content}`;
+          })
+        );
+        const combinedCode = fileContents.join('\n\n');
+        const filesLang = filesLanguage || 'unknown';
+        const filesRoute = await routeToModel('code');
+        const filesOutputConstraint = filesRoute.hints.outputConstraint
+          ? ` ${filesRoute.hints.outputConstraint}`
+          : '';
+
+        const filesMessages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: `Expert ${filesLang} developer. Your task: ${filesTask}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.${filesOutputConstraint}`,
+          },
+          {
+            role: 'user',
+            content: `\`\`\`${filesLang}\n${combinedCode}\n\`\`\``,
+          },
+        ];
+
+        const filesResp = await chatCompletionStreaming(filesMessages, {
+          temperature: filesRoute.hints.codeTemp,
+          maxTokens: filesMaxTokens ?? DEFAULT_MAX_TOKENS,
+          model: filesRoute.modelId,
+          progressToken,
+        });
+
+        const filesFooter = formatFooter(filesResp, filesLang);
+        const filesSuggestionLine = filesRoute.suggestion ? `\n${filesRoute.suggestion}` : '';
+        return { content: [{ type: 'text', text: filesResp.content + filesFooter + filesSuggestionLine }] };
       }
 
       case 'discover': {
