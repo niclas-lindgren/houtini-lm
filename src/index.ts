@@ -34,7 +34,8 @@ const MAX_OUTPUT_TOKENS = 16_384;  // ceiling for adaptive budgets — prevents 
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
-const SOFT_TIMEOUT_MS = 55_000;              // return partial results before MCP SDK ~60s timeout
+const SOFT_TIMEOUT_MS = 55_000;              // fallback when no progressToken — must beat ~60s MCP hard limit
+const LONG_SOFT_TIMEOUT_MS = 10 * 60_000;   // when progressToken present, notifications reset the client clock
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk
 const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
 
@@ -510,6 +511,11 @@ async function chatCompletionStreamingInner(
     }).catch(() => { /* best-effort */ });
   }
 
+  // When progressToken is present, each progress notification resets the MCP client's 60s clock,
+  // so the absolute soft timeout is no longer needed to protect against client-side hard timeout.
+  // Use a long fallback only for stall detection; per-chunk timeout (READ_CHUNK_TIMEOUT_MS) still fires.
+  const softTimeout = options.progressToken !== undefined ? LONG_SOFT_TIMEOUT_MS : SOFT_TIMEOUT_MS;
+
   let content = '';
   let chunkCount = 0;
   let model = '';
@@ -524,15 +530,15 @@ async function chatCompletionStreamingInner(
     while (true) {
       // Check soft timeout before each read
       const elapsed = Date.now() - startTime;
-      if (elapsed > SOFT_TIMEOUT_MS) {
+      if (elapsed > softTimeout) {
         truncated = true;
-        process.stderr.write(`[houtini-lm] Soft timeout at ${elapsed}ms, returning ${content.length} chars of partial content\n`);
+        process.stderr.write(`[houtini-lm] Soft timeout at ${elapsed}ms (limit=${softTimeout}ms), returning ${content.length} chars of partial content\n`);
         break;
       }
 
       // First chunk: allow the full remaining budget (TTFT can be long for large inputs).
       // Subsequent chunks: cap at READ_CHUNK_TIMEOUT_MS to detect stalled mid-stream generation.
-      const remaining = SOFT_TIMEOUT_MS - elapsed;
+      const remaining = softTimeout - elapsed;
       const chunkTimeout = firstChunk ? remaining : Math.min(READ_CHUNK_TIMEOUT_MS, remaining);
       const result = await timedRead(reader, chunkTimeout);
 
