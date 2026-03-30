@@ -46,8 +46,43 @@ async function chat(messages, opts = {}) {
   return res.json();
 }
 
+import { normalizePaths } from './dist/normalize-paths.js';
+
 console.log('\n=== Houtini LM Test Suite ===\n');
 console.log(`Target: ${BASE}`);
+
+// ── normalizePaths unit tests (no live server needed) ───────────
+console.log('--- normalizePaths ---');
+
+await test('array passthrough', () => {
+  const result = normalizePaths(['/a', '/b']);
+  if (!Array.isArray(result)) throw new Error('not an array');
+  if (result[0] !== '/a' || result[1] !== '/b') throw new Error(`got ${JSON.stringify(result)}`);
+});
+
+await test('JSON-encoded array string', () => {
+  const result = normalizePaths('["\/a","\/b"]');
+  if (!Array.isArray(result) || result[0] !== '/a' || result[1] !== '/b')
+    throw new Error(`got ${JSON.stringify(result)}`);
+});
+
+await test('JSON-encoded single-path string', () => {
+  const result = normalizePaths('"\\/path\\/to\\/file.ts"');
+  if (!Array.isArray(result) || result[0] !== '/path/to/file.ts')
+    throw new Error(`got ${JSON.stringify(result)}`);
+});
+
+await test('plain string (not JSON)', () => {
+  const result = normalizePaths('/path/to/file.ts');
+  if (!Array.isArray(result) || result[0] !== '/path/to/file.ts')
+    throw new Error(`got ${JSON.stringify(result)}`);
+});
+
+await test('non-array non-string falls back gracefully', () => {
+  const result = normalizePaths(42);
+  if (!Array.isArray(result) || result[0] !== '42')
+    throw new Error(`got ${JSON.stringify(result)}`);
+});
 
 // ── Health & Models ─────────────────────────────────────────────
 console.log('--- Health & Models ---');

@@ -7,6 +7,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { normalizePaths } from './normalize-paths.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -1241,12 +1242,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'code_task_files': {
-        const { paths, task: filesTask, language: filesLanguage, max_tokens: filesMaxTokens } = args as {
-          paths: string[];
+        const { paths: rawPaths, task: filesTask, language: filesLanguage, max_tokens: filesMaxTokens } = args as {
+          paths: unknown;
           task: string;
           language?: string;
           max_tokens?: number;
         };
+
+        const paths = normalizePaths(rawPaths);
 
         const fileResults = await Promise.allSettled(
           paths.map(async (p) => {
