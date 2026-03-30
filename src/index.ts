@@ -52,8 +52,8 @@ const session = {
 function recordUsage(resp: StreamingResult) {
   session.calls++;
   if (resp.usage) {
-    session.promptTokens += resp.usage.prompt_tokens;
-    session.completionTokens += resp.usage.completion_tokens;
+    session.promptTokens += resp.usage.prompt_tokens ?? 0;
+    session.completionTokens += resp.usage.completion_tokens ?? 0;
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses)
     session.completionTokens += Math.ceil(resp.content.length / 4);
@@ -1214,12 +1214,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_tokens?: number;
         };
 
-        const fileContents = await Promise.all(
+        const fileResults = await Promise.allSettled(
           paths.map(async (p) => {
             const content = await readFile(p, 'utf8');
             return `// --- ${p} ---\n${content}`;
           })
         );
+        const failed = fileResults
+          .map((r, i) => r.status === 'rejected' ? paths[i] : null)
+          .filter((p): p is string => p !== null);
+        if (failed.length > 0) {
+          return { isError: true, content: [{ type: 'text', text: `Cannot read file(s): ${failed.join(', ')}` }] };
+        }
+        const fileContents = (fileResults as PromiseFulfilledResult<string>[]).map(r => r.value);
         const combinedCode = fileContents.join('\n\n');
         const filesLang = filesLanguage || 'unknown';
         const filesRoute = await routeToModel('code');
