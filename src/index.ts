@@ -29,6 +29,7 @@ const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
 const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
 const DEFAULT_MAX_TOKENS = 2048;
+const MAX_OUTPUT_TOKENS = 16_384;  // ceiling for adaptive budgets — prevents runaway generation
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
@@ -84,6 +85,20 @@ function apiHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
   if (LM_PASSWORD) h['Authorization'] = `Bearer ${LM_PASSWORD}`;
   return h;
+}
+
+// ── Adaptive output budget ───────────────────────────────────────────
+// For code analysis tasks the right output budget scales with input size:
+// a 50-line snippet needs ~512 tokens of analysis; a 1000-line file needs more.
+// Formula: reserve 20% of remaining context for output, clamped to [512, MAX_OUTPUT_TOKENS].
+// Callers can always override with an explicit max_tokens argument.
+function adaptiveMaxTokens(inputChars: number, contextLength: number, callerOverride?: number): number {
+  if (callerOverride !== undefined) return callerOverride;
+  const inputTokensEstimate = Math.ceil(inputChars / 4);   // ~4 chars per token for code
+  const overhead = 512;                                     // system prompt + formatting
+  const available = contextLength - inputTokensEstimate - overhead;
+  const budget = Math.floor(available * 0.20);             // use up to 20% of remaining context
+  return Math.min(Math.max(budget, 512), MAX_OUTPUT_TOKENS);
 }
 
 // ── Request semaphore ────────────────────────────────────────────────
@@ -479,6 +494,21 @@ async function chatCompletionStreamingInner(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+
+  // Send one "started" notification immediately so the MCP client resets its
+  // 60s request timeout now — before any tokens arrive. Without this, a long
+  // TTFT (common on large files) eats into the whole budget with no resets.
+  if (options.progressToken !== undefined) {
+    server.notification({
+      method: 'notifications/progress',
+      params: {
+        progressToken: options.progressToken,
+        progress: 0,
+        message: 'Inference started, waiting for first token...',
+      },
+    }).catch(() => { /* best-effort */ });
+  }
+
   let content = '';
   let chunkCount = 0;
   let model = '';
@@ -487,6 +517,7 @@ async function chatCompletionStreamingInner(
   let truncated = false;
   let buffer = '';
   let ttftMs: number | undefined;
+  let firstChunk = true;
 
   try {
     while (true) {
@@ -498,9 +529,10 @@ async function chatCompletionStreamingInner(
         break;
       }
 
-      // Read with per-chunk timeout (handles stalled generation)
+      // First chunk: allow the full remaining budget (TTFT can be long for large inputs).
+      // Subsequent chunks: cap at READ_CHUNK_TIMEOUT_MS to detect stalled mid-stream generation.
       const remaining = SOFT_TIMEOUT_MS - elapsed;
-      const chunkTimeout = Math.min(READ_CHUNK_TIMEOUT_MS, remaining);
+      const chunkTimeout = firstChunk ? remaining : Math.min(READ_CHUNK_TIMEOUT_MS, remaining);
       const result = await timedRead(reader, chunkTimeout);
 
       if (result === 'timeout') {
@@ -511,6 +543,7 @@ async function chatCompletionStreamingInner(
 
       if (result.done) break;
 
+      firstChunk = false;
       buffer += decoder.decode(result.value, { stream: true });
 
       // Parse SSE lines
@@ -646,6 +679,7 @@ type TaskType = 'code' | 'chat' | 'analysis' | 'embedding';
 interface RoutingDecision {
   modelId: string;
   hints: PromptHints;
+  contextLength: number;
   suggestion?: string;  // info about routing decision
 }
 
@@ -656,7 +690,7 @@ async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
   } catch {
     // Can't reach server — fall back to default
     const hints = getPromptHints(LM_MODEL);
-    return { modelId: LM_MODEL || '', hints };
+    return { modelId: LM_MODEL || '', hints, contextLength: FALLBACK_CONTEXT_LENGTH };
   }
 
   const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
@@ -664,7 +698,7 @@ async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
 
   if (loaded.length === 0) {
     const hints = getPromptHints(LM_MODEL);
-    return { modelId: LM_MODEL || '', hints };
+    return { modelId: LM_MODEL || '', hints, contextLength: FALLBACK_CONTEXT_LENGTH };
   }
 
   // Score each loaded model for the requested task type
@@ -690,7 +724,7 @@ async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
   }
 
   const hints = getPromptHints(bestModel.id, bestModel.arch);
-  const result: RoutingDecision = { modelId: bestModel.id, hints };
+  const result: RoutingDecision = { modelId: bestModel.id, hints, contextLength: getContextLength(bestModel) };
 
   // If the best loaded model isn't ideal for this task, suggest a better available one.
   // We don't JIT-load because model loading takes minutes and the MCP SDK has a ~60s
@@ -1196,7 +1230,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const codeResp = await chatCompletionStreaming(codeMessages, {
           temperature: route.hints.codeTemp,
-          maxTokens: codeMaxTokens ?? DEFAULT_MAX_TOKENS,
+          maxTokens: adaptiveMaxTokens(code.length, route.contextLength, codeMaxTokens),
           model: route.modelId,
           progressToken,
         });
@@ -1247,7 +1281,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const filesResp = await chatCompletionStreaming(filesMessages, {
           temperature: filesRoute.hints.codeTemp,
-          maxTokens: filesMaxTokens ?? DEFAULT_MAX_TOKENS,
+          maxTokens: adaptiveMaxTokens(combinedCode.length, filesRoute.contextLength, filesMaxTokens),
           model: filesRoute.modelId,
           progressToken,
         });
