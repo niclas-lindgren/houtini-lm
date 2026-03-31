@@ -29,14 +29,20 @@ INPUT=$(cat)
 FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
 EXT="\${FILE##*.}"
 case "$EXT" in
-  ts|tsx|js|jsx|mjs|cjs|py|go|rs|sh|bash|rb|java|c|cpp|cs|swift|kt|php)
+  # Binary/media -- let Claude read these directly
+  png|jpg|jpeg|gif|svg|ico|webp|bmp|tiff|\\
+  pdf|zip|tar|gz|bz2|xz|7z|\\
+  mp3|mp4|wav|mov|avi|\\
+  woff|woff2|ttf|eot|\\
+  so|dylib|dll|exe|bin|o|a)
+    exit 0
+    ;;
+  *)
     printf '{"decision":"block","reason":"Use mcp__houtini-lm__code_task_files([\\\"%s\\\"], task) instead of Read for source files."}\\n' "$FILE"
     exit 2
     ;;
 esac
-exit 0
 `;
-
 const HOOK_REMIND = `#!/bin/bash
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""')
