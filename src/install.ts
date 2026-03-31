@@ -57,6 +57,15 @@ case "$EXT" in
 esac
 `;
 
+const HOOK_BASH_GUARD = `#!/bin/bash
+INPUT=$(cat)
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+if ! echo "$CMD" | grep -qE '\\b(grep|rg|sed|awk|cat|head|tail)\\b'; then exit 0; fi
+if ! echo "$CMD" | grep -qE '\\.(ts|tsx|js|jsx|py|go|rs|sh|cs|java|rb|php|c|cpp|h)\\b'; then exit 0; fi
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"Prefer mcp__houtini-lm__code_task_files([paths], task) or mcp__houtini-lm__search_task(query, paths, task) over Bash grep/sed/awk/cat for source files — keeps content out of context."}}\\n'
+exit 0
+`;
+
 const HOOK_REMIND = `#!/bin/bash
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""')
@@ -70,6 +79,7 @@ const HOOKS_CFG = {
   PreToolUse: [
     { matcher: 'Agent', hooks: [{ type: 'command', command: 'bash ~/.claude/hooks/houtini-agent-inject.sh' }] },
     { matcher: 'Read',  hooks: [{ type: 'command', command: 'bash ~/.claude/hooks/houtini-read-guard.sh' }] },
+    { matcher: 'Bash',  hooks: [{ type: 'command', command: 'bash ~/.claude/hooks/houtini-bash-guard.sh' }] },
   ],
   UserPromptSubmit: [
     { matcher: '', hooks: [{ type: 'command', command: 'bash ~/.claude/hooks/houtini-remind.sh' }] },
@@ -79,6 +89,7 @@ const HOOKS_CFG = {
 const HOOK_FILES: Record<string, string> = {
   'houtini-agent-inject.sh': HOOK_AGENT_INJECT,
   'houtini-read-guard.sh':   HOOK_READ_GUARD,
+  'houtini-bash-guard.sh':   HOOK_BASH_GUARD,
   'houtini-remind.sh':       HOOK_REMIND,
 };
 

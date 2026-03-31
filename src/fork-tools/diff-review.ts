@@ -58,7 +58,11 @@ export async function handleDiffReview(
   } else {
     systemPrompt =
       'You are a technical writer. Summarise what this diff changes in plain English.\n' +
-      'Be concise: 2-5 sentences. Focus on intent and effect, not mechanics.' +
+      'Rules:\n' +
+      '- 2-5 bullet points maximum\n' +
+      '- Focus on functional and behavioural changes only — skip style, whitespace, and trivial renames\n' +
+      '- Explain intent and effect, not mechanics (the diff shows what changed)\n' +
+      '- Omit sections with no meaningful changes' +
       constraint;
   }
 

@@ -1050,6 +1050,7 @@ const TOOLS = [
       'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
       'response latency, and cumulative session stats (tokens offloaded so far). ' +
       'Call this if you are unsure whether the local LLM is available before delegating work. ' +
+      'Also the fastest way to check cumulative token savings for the current session and all-time totals from the persistent log. ' +
       'Fast — typically responds in under 1 second, or returns an offline status within 5 seconds if the host is unreachable.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
@@ -1254,7 +1255,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${lang} developer. Your task: ${task}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.${outputConstraint}`,
+            content: `Expert ${lang} developer. Your task: ${task}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis concisely. Use a markdown list only when there are multiple distinct findings; use prose or a single sentence for simple answers.${outputConstraint}`,
           },
           {
             role: 'user',
@@ -1307,7 +1308,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const filesMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${filesLang} developer. Your task: ${filesTask}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.${filesOutputConstraint}`,
+            content: `Expert ${filesLang} developer. Your task: ${filesTask}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis concisely. Use a markdown list only when there are multiple distinct findings; use prose or a single sentence for simple answers.${filesOutputConstraint}`,
           },
           {
             role: 'user',
