@@ -1,4 +1,5 @@
 import type { ForkContext, ChatMessage, ToolResult } from './types.js';
+import { normalizePathsSync } from '../normalize-paths.js';
 
 export const SEARCH_TASK_TOOL = {
   name: 'search_task',
@@ -41,12 +42,13 @@ export async function handleSearchTask(
   ctx: ForkContext,
   progressToken?: string | number,
 ): Promise<ToolResult> {
-  const { query, paths: searchPaths, task: searchTask, file_glob } = args as {
+  const { query, paths: rawSearchPaths, task: searchTask, file_glob } = args as {
     query: string;
-    paths: string[];
+    paths: unknown;
     task: string;
     file_glob?: string;
   };
+  const searchPaths = normalizePathsSync(rawSearchPaths);
 
   const grepArgs = ['-rn'];
   if (file_glob) grepArgs.push(`--include=${file_glob}`);
