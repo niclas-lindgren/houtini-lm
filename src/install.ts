@@ -31,7 +31,7 @@ PROMPT=$(echo "$INPUT" | jq -r '.tool_input.prompt // ""')
 if echo "$PROMPT" | grep -q "houtini\\|code_task_files"; then
   exit 0
 fi
-SUFFIX=$(printf '\\n\\nIMPORTANT: Use mcp__houtini-lm__code_task_files([path], task) instead of Read for source files (optional: max_tokens, language). For chat use mcp__houtini-lm__chat(message, temperature, max_tokens). Hooks do not apply inside subagents.')
+SUFFIX=$(printf '\\n\\nCRITICAL — use these houtini tools instead of native alternatives:\\n- Source files: mcp__houtini-lm__code_task_files(["/abs/path"], task) — NOT Read\\n- Web pages: mcp__houtini-lm__web_fetch(url, task) — NOT WebFetch\\n- Code search: mcp__houtini-lm__search_task(query, paths, task) — NOT Bash grep/find\\n- Quick Q&A: mcp__houtini-lm__chat(message) — NOT direct reasoning\\n- File writes: mcp__houtini-lm__code_write(path, instructions)\\nDo NOT use Read, WebFetch, or Bash grep/sed/awk/find for code or web content.')
 echo "$INPUT" | jq --arg p "\${PROMPT}\${SUFFIX}" '.tool_input.prompt = $p | {hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:.tool_input}}'
 `;
 
@@ -61,7 +61,7 @@ const HOOK_REMIND = `#!/bin/bash
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""')
 if echo "$PROMPT" | grep -qiE '\\b(explain|understand|what does|summarize|review|analyze|look at|check|read|write|create|implement|scaffold|locate)\\b|find all|which files'; then
-  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"HOUTINI REMINDER: use mcp__houtini-lm__code_task_files([paths], task) instead of Read for code comprehension. For file writes: mcp__houtini-lm__code_write(path, instructions). For search: mcp__houtini-lm__search_task(query, paths, task). For long output: mcp__houtini-lm__analyze_output(output, task)."}}'
+  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"HOUTINI REMINDER: use mcp__houtini-lm__code_task_files([paths], task) instead of Read for code comprehension. For file writes: mcp__houtini-lm__code_write(path, instructions). For search: mcp__houtini-lm__search_task(query, paths, task). For long output: mcp__houtini-lm__analyze_output(output, task). For web pages: mcp__houtini-lm__web_fetch(url, task) instead of WebFetch."}}'
 fi
 exit 0
 `;
