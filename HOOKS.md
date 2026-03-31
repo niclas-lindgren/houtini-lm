@@ -1,8 +1,9 @@
 # Houtini LM — Claude Code Hooks
 
-Two hook scripts integrate houtini-lm into Claude Code's tooling:
+Three hook scripts integrate houtini-lm into Claude Code's tooling:
 
-- **read-guard** — nudges Claude to use `code_task_files` instead of `Read` when working with source files, keeping file content out of Claude's context window.
+- **agent-inject** — injects a houtini reminder into subagent prompts before they run, since hooks don't fire inside spawned subagents. Ensures Explore/Plan/general-purpose agents use `code_task_files` instead of `Read`.
+- **read-guard** — nudges Claude to prefer `code_task_files` over `Read` for source files (allows the Read so `Edit`/`Write` workflows still function; blocking would cause Claude to bypass via `Bash cat` anyway).
 - **remind** — injects a reminder about houtini-lm tools when Claude's prompt contains comprehension or write keywords (`explain`, `understand`, `review`, `write`, `implement`, `find all`, etc.).
 
 ## Install
@@ -13,7 +14,7 @@ Run once from this fork's GitHub repo — no npm publish required:
 npx github:niclas-lindgren/lm install
 ```
 
-To overwrite existing hooks (e.g. after updating):
+To overwrite existing hooks and clean up stale settings.json entries (e.g. after updating):
 
 ```sh
 npx github:niclas-lindgren/lm install --force
@@ -24,17 +25,22 @@ npx github:niclas-lindgren/lm install --force
 ### Hook scripts
 
 ```
+~/.claude/hooks/houtini-agent-inject.sh
 ~/.claude/hooks/houtini-read-guard.sh
 ~/.claude/hooks/houtini-remind.sh
 ```
 
 ### settings.json entries
 
-Two entries are merged into `~/.claude/settings.json` under `hooks`:
+Three entries are merged into `~/.claude/settings.json` under `hooks`:
 
 ```json
 "hooks": {
   "PreToolUse": [
+    {
+      "matcher": "Agent",
+      "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/houtini-agent-inject.sh" }]
+    },
     {
       "matcher": "Read",
       "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/houtini-read-guard.sh" }]
@@ -49,10 +55,12 @@ Two entries are merged into `~/.claude/settings.json` under `hooks`:
 }
 ```
 
+`patchSettings` is idempotent — it checks for each entry by exact command string and only appends missing ones. `--force` strips all existing `houtini-` entries first, then re-adds them fresh.
+
 ## Uninstall
 
-1. Delete the two hook files:
+1. Delete the hook files:
    ```sh
-   rm ~/.claude/hooks/houtini-read-guard.sh ~/.claude/hooks/houtini-remind.sh
+   rm ~/.claude/hooks/houtini-agent-inject.sh ~/.claude/hooks/houtini-read-guard.sh ~/.claude/hooks/houtini-remind.sh
    ```
-2. Open `~/.claude/settings.json` and remove the two hook entries shown above from the `PreToolUse` and `UserPromptSubmit` arrays.
+2. Open `~/.claude/settings.json` and remove the three hook entries shown above.
