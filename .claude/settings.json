@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/niclasl/src/houtini-lm/.claude/hooks/ts-typecheck.js",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
