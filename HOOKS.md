@@ -11,13 +11,13 @@ Three hook scripts integrate houtini-lm into Claude Code's tooling:
 Run once from this fork's GitHub repo — no npm publish required:
 
 ```sh
-npx github:niclas-lindgren/lm install
+npx github:niclas-lindgren/houtini-lm install
 ```
 
 To overwrite existing hooks and clean up stale settings.json entries (e.g. after updating):
 
 ```sh
-npx github:niclas-lindgren/lm install --force
+npx github:niclas-lindgren/houtini-lm install --force
 ```
 
 ## What gets written
