@@ -1,6 +1,11 @@
 node_modules/
 dist/
 .claude/
+!.claude/settings.json
+!.claude/hooks/
+!.claude/hooks/**
+!.claude/skills/
+!.claude/skills/**
 .env
 .env.*
 *.log
