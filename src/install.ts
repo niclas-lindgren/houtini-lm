@@ -5,7 +5,7 @@
  *   - PreToolUse(Read) on source files is hard-blocked → use code_task_files instead
  *   - UserPromptSubmit with comprehension keywords injects a Houtini reminder
  *
- * Usage: npx houtini-lm install
+ * Usage: npx houtini-lm install [--force]
  */
 
 import { readFile, writeFile, mkdir, access, chmod } from 'node:fs/promises';
@@ -57,9 +57,9 @@ const HOOKS_CFG = {
   UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: 'bash ~/.claude/hooks/houtini-remind.sh' }] }],
 };
 
-async function writeHook(hooksDir: string, filename: string, content: string) {
+async function writeHook(hooksDir: string, filename: string, content: string, force = false) {
   const p = join(hooksDir, filename);
-  if (await exists(p)) { skip(filename); return; }
+  if (!force && await exists(p)) { skip(filename); return; }
   try {
     await writeFile(p, content, 'utf8');
     await chmod(p, 0o755);
@@ -103,8 +103,8 @@ async function patchSettings(settingsPath: string) {
   pass('settings.json hooks');
 }
 
-export async function runInstall() {
-  process.stdout.write('\nHoutini LM — Claude Code hook installer\n\n');
+export async function runInstall(force = false) {
+  process.stdout.write(`\nHoutini LM — Claude Code hook installer${force ? ' (--force)' : ''}\n\n`);
 
   const claudeDir = join(homedir(), '.claude');
   const hooksDir = join(claudeDir, 'hooks');
@@ -112,8 +112,8 @@ export async function runInstall() {
 
   await mkdir(hooksDir, { recursive: true });
 
-  await writeHook(hooksDir, 'houtini-read-guard.sh', HOOK_READ_GUARD);
-  await writeHook(hooksDir, 'houtini-remind.sh', HOOK_REMIND);
+  await writeHook(hooksDir, 'houtini-read-guard.sh', HOOK_READ_GUARD, force);
+  await writeHook(hooksDir, 'houtini-remind.sh', HOOK_REMIND, force);
   await patchSettings(settingsPath);
 
   process.stdout.write('\nDone. Restart Claude Code to activate the hooks.\n\n');

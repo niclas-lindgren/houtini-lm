@@ -1590,7 +1590,8 @@ async function main() {
 }
 
 if (process.argv[2] === 'install') {
-  runInstall().catch((error) => {
+  const force = process.argv.includes('--force');
+  runInstall(force).catch((error) => {
     process.stderr.write(`Install failed: ${error}\n`);
     process.exit(1);
   });
