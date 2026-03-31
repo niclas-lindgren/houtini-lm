@@ -76,11 +76,12 @@ export async function handleSearchTask(
 
   const route = await ctx.routeToModel('analysis');
 
+  const systemContent = route.hints.outputConstraint
+    ? `You are a code search assistant. Answer the question using only the grep results provided. Be specific — reference file names and line numbers.\n\n${route.hints.outputConstraint}`
+    : 'You are a code search assistant. Answer the question using only the grep results provided. Be specific — reference file names and line numbers.';
+
   const messages: ChatMessage[] = [
-    {
-      role: 'system',
-      content: 'You are a code search assistant. Answer the question using only the grep results provided. Be specific — reference file names and line numbers.',
-    },
+    { role: 'system', content: systemContent },
     {
       role: 'user',
       content: `Question: ${searchTask}\n\nGrep results (${matchCount} matches across ${fileCount} files):\n${grepOutput}`,
@@ -89,7 +90,7 @@ export async function handleSearchTask(
 
   const resp = await ctx.chatCompletionStreaming(messages, {
     temperature: route.hints.chatTemp,
-    maxTokens: 512,
+    maxTokens: ctx.adaptiveMaxTokens(grepOutput.length + searchTask.length, route.contextLength),
     model: route.modelId,
     progressToken,
   });
