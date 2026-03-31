@@ -6,8 +6,11 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, appendFile, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { normalizePaths } from './normalize-paths.js';
+import { runInstall } from './install.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -25,6 +28,8 @@ import {
   getThinkingSupport,
   type PromptHints,
 } from './model-cache.js';
+
+const SESSION_LOG_PATH = join(homedir(), '.houtini-lm', 'session-log.jsonl');
 
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
@@ -74,6 +79,18 @@ function recordUsage(resp: StreamingResult) {
       existing.totalTokPerSec += tokPerSec;
     }
     session.modelStats.set(resp.model, existing);
+  }
+  // Persist to session log (fire-and-forget — never block the response)
+  if (resp.usage || resp.model) {
+    const entry = JSON.stringify({
+      ts: Date.now(),
+      model: resp.model ?? null,
+      promptTokens: resp.usage?.prompt_tokens ?? 0,
+      completionTokens: resp.usage?.completion_tokens ?? Math.ceil(resp.content.length / 4),
+    });
+    mkdir(join(homedir(), '.houtini-lm'), { recursive: true })
+      .then(() => appendFile(SESSION_LOG_PATH, entry + '\n', 'utf8'))
+      .catch(() => { /* non-fatal */ });
   }
 }
 
@@ -1005,7 +1022,7 @@ const TOOLS = [
         paths: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to source files to analyse. All files are concatenated and sent to the LLM.',
+          description: 'Absolute paths to source files to analyse. Glob patterns are supported (e.g. "/src/**/*.ts"). Capped at 20 files. All files are concatenated and sent to the LLM.',
         },
         task: {
           type: 'string',
@@ -1040,6 +1057,31 @@ const TOOLS = [
       'and a capability profile describing what the model is best at. ' +
       'Use this to understand which models are available and suggest switching when a different model would suit the task better.',
     inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'diff_review',
+    description:
+      'Analyse a git diff using the local LLM. Three modes:\n' +
+      '• commit_message — write a properly formatted git commit message (subject + body, imperative mood, no Co-Authored-By)\n' +
+      '• review — group findings as Critical / Warning / Suggestion with file names and line references\n' +
+      '• summary — plain English 2-5 sentence description of what changed and why\n\n' +
+      'Pass the raw output of `git diff`, `git diff HEAD~1`, or `git show`. ' +
+      'For commit messages, add the Co-Authored-By trailer yourself before committing.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        diff: {
+          type: 'string',
+          description: 'Raw git diff output. Include the full diff — do not truncate.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['commit_message', 'review', 'summary'],
+          description: 'commit_message: write a git commit message. review: find bugs/issues. summary: plain English description.',
+        },
+      },
+      required: ['diff', 'mode'],
+    },
   },
   {
     name: 'embed',
@@ -1255,7 +1297,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_tokens?: number;
         };
 
-        const paths = normalizePaths(rawPaths);
+        const paths = await normalizePaths(rawPaths);
 
         const fileResults = await Promise.allSettled(
           paths.map(async (p) => {
@@ -1376,8 +1418,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        text += `${sessionStats}\n\n`;
-        text += `The local LLM is available. You can delegate tasks using chat, custom_prompt, code_task, or embed.`;
+        text += `${sessionStats}\n`;
+
+        // All-time totals from persistent log
+        try {
+          const logContent = await readFile(SESSION_LOG_PATH, 'utf8').catch(() => '');
+          if (logContent.trim()) {
+            const lines = logContent.trim().split('\n');
+            let totalPrompt = 0;
+            let totalCompletion = 0;
+            for (const line of lines) {
+              try {
+                const e = JSON.parse(line) as { promptTokens: number; completionTokens: number };
+                totalPrompt += e.promptTokens ?? 0;
+                totalCompletion += e.completionTokens ?? 0;
+              } catch { /* skip malformed lines */ }
+            }
+            const allTime = totalPrompt + totalCompletion;
+            if (allTime > 0) {
+              text += `All-time: ${allTime.toLocaleString()} tokens offloaded across ${lines.length} call${lines.length === 1 ? '' : 's'}\n`;
+            }
+          }
+        } catch { /* log unreadable — skip silently */ }
+
+        text += `\nThe local LLM is available. You can delegate tasks using chat, custom_prompt, code_task, or embed.`;
 
         return { content: [{ type: 'text', text }] };
       }
@@ -1455,6 +1519,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
       }
 
+      case 'diff_review': {
+        const { diff, mode } = args as { diff: string; mode: 'commit_message' | 'review' | 'summary' };
+        const route = await routeToModel('code');
+        const constraint = route.hints.outputConstraint ? `\n${route.hints.outputConstraint}` : '';
+
+        let systemPrompt: string;
+        if (mode === 'commit_message') {
+          systemPrompt =
+            'You are an expert developer writing git commit messages.\n' +
+            'Rules:\n' +
+            '- Subject line: imperative mood, max 72 chars, no trailing period\n' +
+            '- Blank line between subject and body\n' +
+            '- Body: explain WHY, not WHAT (the diff shows what)\n' +
+            '- No Co-Authored-By line (the caller adds that)\n' +
+            '- Output only the commit message text, no preamble' +
+            constraint;
+        } else if (mode === 'review') {
+          systemPrompt =
+            'You are a senior code reviewer. Review the diff for bugs, missing edge cases, style issues, and security concerns.\n' +
+            'Group findings under these headings (omit empty sections):\n' +
+            '**Critical** — bugs, security issues, data loss risks\n' +
+            '**Warning** — edge cases, correctness concerns, unclear logic\n' +
+            '**Suggestion** — style, naming, minor improvements\n' +
+            'Be specific: reference file names and line numbers.' +
+            constraint;
+        } else {
+          systemPrompt =
+            'You are a technical writer. Summarise what this diff changes in plain English.\n' +
+            'Be concise: 2-5 sentences. Focus on intent and effect, not mechanics.' +
+            constraint;
+        }
+
+        const diffMessages: ChatMessage[] = [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `\`\`\`diff\n${diff}\n\`\`\`` },
+        ];
+
+        const diffResp = await chatCompletionStreaming(diffMessages, {
+          temperature: route.hints.codeTemp,
+          model: route.modelId,
+          progressToken,
+        });
+
+        const diffFooter = formatFooter(diffResp);
+        return { content: [{ type: 'text', text: diffResp.content + diffFooter }] };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1478,7 +1589,14 @@ async function main() {
     .catch((err) => process.stderr.write(`[houtini-lm] Startup profiling skipped: ${err}\n`));
 }
 
-main().catch((error) => {
-  process.stderr.write(`Fatal error: ${error}\n`);
-  process.exit(1);
-});
+if (process.argv[2] === 'install') {
+  runInstall().catch((error) => {
+    process.stderr.write(`Install failed: ${error}\n`);
+    process.exit(1);
+  });
+} else {
+  main().catch((error) => {
+    process.stderr.write(`Fatal error: ${error}\n`);
+    process.exit(1);
+  });
+}
