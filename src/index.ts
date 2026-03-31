@@ -6,7 +6,9 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
-import { readFile, appendFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, appendFile, mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { normalizePaths } from './normalize-paths.js';
@@ -34,6 +36,7 @@ const SESSION_LOG_PATH = join(homedir(), '.houtini-lm', 'session-log.jsonl');
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
 const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
+const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_TOKENS = 2048;
 const MAX_OUTPUT_TOKENS = 16_384;  // ceiling for adaptive budgets — prevents runaway generation
 const DEFAULT_TEMPERATURE = 0.3;
@@ -1104,6 +1107,102 @@ const TOOLS = [
       required: ['input'],
     },
   },
+  {
+    name: 'code_write',
+    description:
+      'Write or edit a file using the local LLM. The server reads the file and writes the result ' +
+      'directly to disk — Claude never sees the file content, saving both prompt and output tokens.\n\n' +
+      'WHEN TO USE (saves ~4K tokens per 400-line file):\n' +
+      '\u2022 Create new files from clear specifications\n' +
+      '\u2022 Edit existing files with well-defined instructions\n\n' +
+      'WHEN NOT TO USE:\n' +
+      '\u2022 Subtle refactors requiring architectural judgment — use Claude directly\n' +
+      '\u2022 Multi-file changes with complex interdependencies\n\n' +
+      'Always verify the written file compiles and behaves correctly after calling this tool.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute path to file. Existing file \u2192 edited in place. New path \u2192 created.',
+        },
+        instructions: {
+          type: 'string',
+          description: 'What to write or change: "add error handling to fetchUser", "write a debounce utility".',
+        },
+        language: {
+          type: 'string',
+          description: 'Programming language. Inferred from file extension if omitted.',
+        },
+      },
+      required: ['path', 'instructions'],
+    },
+  },
+  {
+    name: 'analyze_output',
+    description:
+      'Compress long command output using the local LLM — extract only what you need.\n\n' +
+      'WHEN TO USE (saves 1\u20132K tokens per run):\n' +
+      '\u2022 npm test / jest output — extract only failing tests\n' +
+      '\u2022 tsc / build logs — find the root error\n' +
+      '\u2022 Any verbose CLI output where you need a specific subset\n\n' +
+      'WHEN NOT TO USE:\n' +
+      '\u2022 Short output (< 50 lines) — just read it directly\n' +
+      '\u2022 When you need exact raw content (e.g. a specific line number)',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        output: {
+          type: 'string',
+          description: 'Raw command output (stdout/stderr).',
+        },
+        task: {
+          type: 'string',
+          description: 'What to extract: "failing tests and their errors", "root build error", "all warnings".',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Max response tokens. Default 512.',
+        },
+      },
+      required: ['output', 'task'],
+    },
+  },
+  {
+    name: 'search_task',
+    description:
+      'Search a codebase and answer a question about the results using the local LLM.\n\n' +
+      'WHEN TO USE (saves significant tokens on large codebases):\n' +
+      '\u2022 "Which files import AuthService?" — grep returns 80 lines, this returns 1 sentence\n' +
+      '\u2022 "Where is deleteUser called?" — distills noisy grep output to the relevant answer\n\n' +
+      'WHEN NOT TO USE:\n' +
+      '\u2022 When you need precise line numbers — fall back to Grep for exact locations\n' +
+      '\u2022 Small codebases where grep output is already compact\n\n' +
+      'Quality safeguard: the raw match count is always returned so you can verify the answer.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search string or regex passed to grep -rn.',
+        },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Absolute directory paths to search in.',
+        },
+        task: {
+          type: 'string',
+          description: 'Question to answer: "which files import X?", "find all calls to deleteUser".',
+        },
+        file_glob: {
+          type: 'string',
+          description: 'Optional file pattern filter, e.g. "*.ts" or "*.py".',
+        },
+      },
+      required: ['query', 'paths', 'task'],
+    },
+  },
 ];
 
 // ── MCP Server ───────────────────────────────────────────────────────
@@ -1564,6 +1663,169 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const diffFooter = formatFooter(diffResp);
         return { content: [{ type: 'text', text: diffResp.content + diffFooter }] };
+      }
+
+      case 'code_write': {
+        const { path: filePath, instructions, language: writeLanguage } = args as {
+          path: string;
+          instructions: string;
+          language?: string;
+        };
+
+        const ext = filePath.split('.').pop() ?? '';
+        const lang = writeLanguage || ext || 'unknown';
+
+        const route = await routeToModel('code');
+        const constraint = route.hints.outputConstraint ? `\n\n${route.hints.outputConstraint}` : '';
+
+        let existingContent = '';
+        let fileExists = false;
+        try {
+          existingContent = await readFile(filePath, 'utf8');
+          fileExists = true;
+        } catch { /* new file */ }
+
+        const inputChars = existingContent.length + instructions.length;
+
+        const writeMessages: ChatMessage[] = fileExists
+          ? [
+              {
+                role: 'system',
+                content: `Expert ${lang} developer. Rewrite the file as instructed. Output ONLY the complete new file content — no explanation, no markdown fences, no preamble.${constraint}`,
+              },
+              {
+                role: 'user',
+                content: `File: ${filePath}\n\n\`\`\`${lang}\n${existingContent}\n\`\`\`\n\nInstructions: ${instructions}`,
+              },
+            ]
+          : [
+              {
+                role: 'system',
+                content: `Expert ${lang} developer. Write the new file as instructed. Output ONLY the complete file content — no explanation, no markdown fences, no preamble.${constraint}`,
+              },
+              {
+                role: 'user',
+                content: `File to create: ${filePath}\n\nInstructions: ${instructions}`,
+              },
+            ];
+
+        const writeResp = await chatCompletionStreaming(writeMessages, {
+          temperature: route.hints.codeTemp,
+          maxTokens: adaptiveMaxTokens(inputChars, route.contextLength),
+          model: route.modelId,
+          progressToken,
+        });
+
+        if (!writeResp.content.trim()) {
+          return { isError: true, content: [{ type: 'text', text: 'Local LLM returned empty output — file not written.' }] };
+        }
+
+        // Strip markdown fences if the model wrapped output despite instructions
+        let fileContent = writeResp.content.trim();
+        const fenceMatch = fileContent.match(/^```(?:\w+)?\n([\s\S]*?)\n```$/);
+        if (fenceMatch) fileContent = fenceMatch[1];
+
+        await writeFile(filePath, fileContent, 'utf8');
+        const lineCount = fileContent.split('\n').length;
+
+        const writeFooter = formatFooter(writeResp, lang);
+        return {
+          content: [{ type: 'text', text: `Written ${lineCount} lines to ${filePath}${writeFooter}` }],
+        };
+      }
+
+      case 'analyze_output': {
+        const { output, task: analyzeTask, max_tokens: analyzeMaxTokens } = args as {
+          output: string;
+          task: string;
+          max_tokens?: number;
+        };
+
+        const analyzeRoute = await routeToModel('analysis');
+
+        const analyzeMessages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: 'You are a log analysis assistant. Extract only what the task asks for. Be concise and specific — include file names and line numbers where relevant.',
+          },
+          {
+            role: 'user',
+            content: `Task: ${analyzeTask}\n\nOutput:\n${output}`,
+          },
+        ];
+
+        const analyzeResp = await chatCompletionStreaming(analyzeMessages, {
+          temperature: analyzeRoute.hints.chatTemp,
+          maxTokens: analyzeMaxTokens ?? 512,
+          model: analyzeRoute.modelId,
+          progressToken,
+        });
+
+        const analyzeFooter = formatFooter(analyzeResp);
+        return { content: [{ type: 'text', text: analyzeResp.content + analyzeFooter }] };
+      }
+
+      case 'search_task': {
+        const { query, paths: searchPaths, task: searchTask, file_glob } = args as {
+          query: string;
+          paths: string[];
+          task: string;
+          file_glob?: string;
+        };
+
+        const grepArgs = ['-rn'];
+        if (file_glob) grepArgs.push(`--include=${file_glob}`);
+        grepArgs.push('--', query, ...searchPaths);
+
+        let grepOutput = '';
+        let matchCount = 0;
+        let fileCount = 0;
+
+        try {
+          const { stdout } = await execFileAsync('grep', grepArgs, { timeout: 10_000 });
+          const lines = stdout.trim().split('\n').filter(Boolean);
+          matchCount = lines.length;
+          fileCount = new Set(lines.map((l: string) => l.split(':')[0])).size;
+          // Cap at 500 lines to avoid token overflow
+          grepOutput = lines.length > 500
+            ? lines.slice(0, 500).join('\n') + `\n... (truncated at 500 of ${lines.length} matches)`
+            : lines.join('\n');
+        } catch (err: unknown) {
+          const execErr = err as { code?: number };
+          if (execErr.code === 1) {
+            // grep exit code 1 = no matches (not an error)
+            return { content: [{ type: 'text', text: `No matches for '${query}' in the specified paths.` }] };
+          }
+          return { isError: true, content: [{ type: 'text', text: `grep failed: ${err instanceof Error ? err.message : String(err)}` }] };
+        }
+
+        const searchRoute = await routeToModel('analysis');
+
+        const searchMessages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: 'You are a code search assistant. Answer the question using only the grep results provided. Be specific — reference file names and line numbers.',
+          },
+          {
+            role: 'user',
+            content: `Question: ${searchTask}\n\nGrep results (${matchCount} matches across ${fileCount} files):\n${grepOutput}`,
+          },
+        ];
+
+        const searchResp = await chatCompletionStreaming(searchMessages, {
+          temperature: searchRoute.hints.chatTemp,
+          maxTokens: 512,
+          model: searchRoute.modelId,
+          progressToken,
+        });
+
+        const searchFooter = formatFooter(searchResp);
+        return {
+          content: [{
+            type: 'text',
+            text: searchResp.content + `\n\n(${matchCount} raw matches across ${fileCount} files)` + searchFooter,
+          }],
+        };
       }
 
       default:

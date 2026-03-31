@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.9.0] - 2026-03-31
+
+### Added
+- **`code_write` tool** — local LLM reads and rewrites files directly to disk; Claude never sees the file content, saving ~4K tokens per 400-line file edit
+- **`analyze_output` tool** — compresses long command/test output (npm test, tsc, build logs) into targeted summaries; saves 1–2K tokens per invocation
+- **`search_task` tool** — runs grep server-side and has the local LLM distill the results into a direct answer; Claude gets the answer, not the raw dump
+- **Updated remind hook** — `houtini-remind.sh` now triggers on write/create/implement/search/locate patterns and lists all four offload tools in the reminder context
+- **`HOUTINI_GUARD_EXCLUDE` env var** — set to a path prefix to bypass the read-guard for specific directories (useful during development on houtini-lm itself)
+
+### Fixed
+- **Read-guard no longer hard-blocks `Read`** — converted from a blocking hook to a pass-through; the `Read → Edit` workflow now works correctly across all repos. Nudging toward `code_task_files` is handled by the prompt-submit remind hook instead.
+
 ## [2.8.0] - 2026-03-18
 
 ### Added

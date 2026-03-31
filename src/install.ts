@@ -27,6 +27,8 @@ async function exists(p: string): Promise<boolean> {
 const HOOK_READ_GUARD = `#!/bin/bash
 INPUT=$(cat)
 FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
+# Allow bypass for specific directories (set HOUTINI_GUARD_EXCLUDE to a path prefix)
+if [ -n "$HOUTINI_GUARD_EXCLUDE" ] && [[ "$FILE" == "$HOUTINI_GUARD_EXCLUDE"* ]]; then exit 0; fi
 EXT="\${FILE##*.}"
 case "$EXT" in
   # Binary/media -- let Claude read these directly
@@ -38,16 +40,15 @@ case "$EXT" in
     exit 0
     ;;
   *)
-    printf '{"decision":"block","reason":"Use mcp__houtini-lm__code_task_files([\\\"%s\\\"], task) instead of Read for source files."}\\n' "$FILE"
-    exit 2
+    exit 0
     ;;
 esac
 `;
 const HOOK_REMIND = `#!/bin/bash
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""')
-if echo "$PROMPT" | grep -qiE '\\b(explain|understand|what does|summarize|review|analyze|look at|check|read)\\b'; then
-  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"HOUTINI REMINDER: use mcp__houtini-lm__code_task_files([paths], task) instead of Read for code comprehension."}}'
+if echo "$PROMPT" | grep -qiE '\\b(explain|understand|what does|summarize|review|analyze|look at|check|read|write|create|implement|scaffold|locate)\\b|find all|which files'; then
+  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"HOUTINI REMINDER: use mcp__houtini-lm__code_task_files([paths], task) instead of Read for code comprehension. For file writes: mcp__houtini-lm__code_write(path, instructions). For search: mcp__houtini-lm__search_task(query, paths, task). For long output: mcp__houtini-lm__analyze_output(output, task)."}}'
 fi
 exit 0
 `;
