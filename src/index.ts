@@ -1223,7 +1223,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const resp = await chatCompletionStreaming(messages, {
           temperature: temperature ?? route.hints.chatTemp,
-          maxTokens: max_tokens,
+          maxTokens: adaptiveMaxTokens((context?.length ?? 0) + instruction.length, route.contextLength, max_tokens),
           model: route.modelId,
           responseFormat,
           progressToken,
