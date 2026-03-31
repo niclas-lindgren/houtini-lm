@@ -71,13 +71,28 @@ async function patchSettings(settingsPath: string) {
     // File missing or invalid — start fresh with just the hooks key
   }
 
-  const existing = cfg.hooks as Record<string, unknown> | undefined;
-  if (existing && existing['PreToolUse'] && existing['UserPromptSubmit']) {
+  const hooks = (cfg.hooks ?? {}) as Record<string, unknown[]>;
+
+  // Check if our specific entries are already present (by command value)
+  const alreadyHasReadGuard = (hooks['PreToolUse'] as { hooks?: { command?: string }[] }[] | undefined)
+    ?.some((e) => e.hooks?.some((h) => h.command?.includes('houtini-read-guard')));
+  const alreadyHasRemind = (hooks['UserPromptSubmit'] as { hooks?: { command?: string }[] }[] | undefined)
+    ?.some((e) => e.hooks?.some((h) => h.command?.includes('houtini-remind')));
+
+  if (alreadyHasReadGuard && alreadyHasRemind) {
     skip('settings.json hooks');
     return;
   }
 
-  cfg.hooks = { ...(existing ?? {}), ...HOOKS_CFG };
+  // Merge: append our entries to existing arrays rather than replacing them
+  if (!alreadyHasReadGuard) {
+    hooks['PreToolUse'] = [...(hooks['PreToolUse'] ?? []), ...HOOKS_CFG.PreToolUse];
+  }
+  if (!alreadyHasRemind) {
+    hooks['UserPromptSubmit'] = [...(hooks['UserPromptSubmit'] ?? []), ...HOOKS_CFG.UserPromptSubmit];
+  }
+  cfg.hooks = hooks;
+
   await writeFile(settingsPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
   pass('settings.json hooks');
 }
