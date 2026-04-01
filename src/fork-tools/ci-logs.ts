@@ -41,6 +41,7 @@ export const CI_LOGS_TOOL = {
 
 const DEFAULT_FILTER = 'Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
 const MAX_LOG_LINES = 400;
+const MAX_LOG_CHARS = 60_000; // ~15k tokens — safe for most local models
 
 export async function handleCiLogs(
   args: unknown,
@@ -125,6 +126,11 @@ export async function handleCiLogs(
     filteredLog = capped.join('\n');
   }
 
+  // Hard cap on characters to stay within local model context limits
+  if (filteredLog.length > MAX_LOG_CHARS) {
+    filteredLog = filteredLog.slice(0, MAX_LOG_CHARS) + `\n... (truncated at ${MAX_LOG_CHARS} chars)`;
+  }
+
   const route = await ctx.routeToModel('analysis');
   const target = job_id ? `job ${job_id}` : `run ${run_id}`;
   const systemContent = [
@@ -136,11 +142,12 @@ export async function handleCiLogs(
     route.hints.outputConstraint ?? '',
   ].filter(Boolean).join('\n');
 
+  const repoLine = repo ? `Repository: ${repo}\n` : '';
   const messages: ChatMessage[] = [
     { role: 'system', content: systemContent },
     {
       role: 'user',
-      content: `Repository: ${repo}\nTarget: ${target}\n\nFiltered log (${matchCount} matching lines):\n\`\`\`\n${filteredLog}\n\`\`\``,
+      content: `${repoLine}Target: ${target}\n\nFiltered log (${matchCount} matching lines):\n\`\`\`\n${filteredLog}\n\`\`\``,
     },
   ];
 
