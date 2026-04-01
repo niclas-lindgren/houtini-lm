@@ -35,7 +35,7 @@ export interface ForkContext {
   ) => Promise<StreamingResult>;
   formatFooter: (resp: StreamingResult, extra?: string) => string;
   adaptiveMaxTokens: (inputChars: number, contextLength: number) => number;
-  execFileAsync: (file: string, args: string[], opts?: { timeout?: number }) => Promise<{ stdout: string }>;
+  execFileAsync: (file: string, args: string[], opts?: { timeout?: number; maxBuffer?: number }) => Promise<{ stdout: string }>;
   readFile: (path: string, enc: 'utf8') => Promise<string>;
   writeFile: (path: string, content: string, enc: 'utf8') => Promise<void>;
 }

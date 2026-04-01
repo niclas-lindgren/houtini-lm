@@ -75,7 +75,7 @@ export async function handleCiLogs(
 
   let rawLog: string;
   try {
-    const { stdout } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000 });
+    const { stdout } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 });
     rawLog = stdout;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
