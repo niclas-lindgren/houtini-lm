@@ -1,4 +1,5 @@
-import { stat, readFile } from 'node:fs/promises';
+import { stat, readFile, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { ForkContext, ChatMessage, ToolResult } from './types.js';
 import { normalizePaths } from '../normalize-paths.js';
 import { initEmbedCache, getCachedChunks, upsertChunks, flushEmbedCache } from './embed-cache.js';
@@ -83,6 +84,31 @@ function chunkFile(lines: string[]): Array<{ chunk_idx: number; content: string;
   return chunks;
 }
 
+/** Enumerate all files under dirs, optionally filtered by a *.ext glob pattern. No file cap. */
+async function enumerateFiles(dirs: string[], fileGlob?: string): Promise<string[]> {
+  const globRe = fileGlob ? fileGlobToRegex(fileGlob) : null;
+  const results: string[] = [];
+  for (const dir of dirs) {
+    try {
+      const entries = await readdir(dir, { recursive: true, withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (globRe && !globRe.test(entry.name)) continue;
+        results.push(join(entry.parentPath ?? dir, entry.name));
+      }
+    } catch { /* skip unreadable dirs */ }
+  }
+  return results;
+}
+
+function fileGlobToRegex(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^$[\]\\()]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '[^/]');
+  return new RegExp(`^${escaped}$`);
+}
+
 function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < a.length; i++) {
@@ -107,17 +133,12 @@ export async function handleSemanticSearch(
     top_k?: number;
   };
 
-  // Resolve paths — normalizePaths expands globs and handles JSON-encoded arrays
-  // We need individual files, so pass file_glob as a synthetic glob if provided
+  // Resolve input paths (handles JSON-encoded arrays from MCP clients)
+  // Then enumerate files directly with readdir — bypasses normalizePaths' 20-file cap
   let filePaths: string[];
   try {
     const dirs = await normalizePaths(rawPaths);
-    // Enumerate files inside each directory
-    const globPatterns = dirs.map((d) =>
-      file_glob ? `${d}/**/${file_glob}` : `${d}/**/*`,
-    );
-    const expanded = await normalizePaths(globPatterns);
-    filePaths = expanded;
+    filePaths = await enumerateFiles(dirs, file_glob);
   } catch (err) {
     return { isError: true, content: [{ type: 'text', text: `Path resolution failed: ${err instanceof Error ? err.message : String(err)}` }] };
   }
@@ -166,23 +187,27 @@ export async function handleSemanticSearch(
     const cached = getCachedChunks(filePath, mtime);
     if (cached) {
       cachedFiles++;
-      for (let i = 0; i < fileChunks.length; i++) {
-        const cv = cached[i];
-        if (cv) allChunks.push({ file: filePath, startLine: fileChunks[i].startLine, content: cv.content, vector: cv.vector });
+      // Index by chunk_idx — guards against gaps if a prior embed was partial
+      const byIdx = new Map(cached.map((c) => [c.chunk_idx, c]));
+      for (const chunk of fileChunks) {
+        const cv = byIdx.get(chunk.chunk_idx);
+        if (cv) allChunks.push({ file: filePath, startLine: chunk.startLine, content: cv.content, vector: cv.vector });
       }
     } else {
       embeddedFiles++;
       const embedded: Array<{ chunk_idx: number; content: string; vector: number[] }> = [];
+      let allSucceeded = true;
       for (const chunk of fileChunks) {
         try {
           const { vector } = await embedText(chunk.content);
           allChunks.push({ file: filePath, startLine: chunk.startLine, content: chunk.content, vector });
           embedded.push({ chunk_idx: chunk.chunk_idx, content: chunk.content, vector });
         } catch {
-          // skip chunk on embed failure
+          allSucceeded = false; // don't cache partial results
         }
       }
-      if (embedded.length > 0) {
+      // Only cache when every chunk embedded successfully — prevents permanent gaps
+      if (embedded.length > 0 && allSucceeded) {
         upsertChunks(filePath, mtime, embedModelId, embedded);
       }
     }
@@ -220,24 +245,27 @@ export async function handleSemanticSearch(
     { role: 'user', content: `Question: ${task}\n\n${excerpts}` },
   ];
 
-  const resp = await ctx.chatCompletionStreaming(messages, {
-    temperature: route.hints.chatTemp,
-    maxTokens: ctx.adaptiveMaxTokens(excerpts.length + task.length, route.contextLength),
-    model: route.modelId,
-    progressToken,
-  });
-
   const uniqueFiles = new Set(topChunks.map((c) => c.file)).size;
   const cacheNote = embeddedFiles > 0
     ? ` (embedded ${embeddedFiles} new file${embeddedFiles !== 1 ? 's' : ''}, ${cachedFiles} from cache)`
     : ' (all from cache)';
 
-  return {
-    content: [{
-      type: 'text',
-      text: resp.content +
-        `\n\n(semantic search: ${allChunks.length} chunks across ${filePaths.length} files, top ${top_k} from ${uniqueFiles} file${uniqueFiles !== 1 ? 's' : ''}${cacheNote})` +
-        ctx.formatFooter(resp),
-    }],
-  };
+  try {
+    const resp = await ctx.chatCompletionStreaming(messages, {
+      temperature: route.hints.chatTemp,
+      maxTokens: ctx.adaptiveMaxTokens(excerpts.length + task.length, route.contextLength),
+      model: route.modelId,
+      progressToken,
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: resp.content +
+          `\n\n(semantic search: ${allChunks.length} chunks across ${filePaths.length} files, top ${top_k} from ${uniqueFiles} file${uniqueFiles !== 1 ? 's' : ''}${cacheNote})` +
+          ctx.formatFooter(resp),
+      }],
+    };
+  } catch (err) {
+    return { isError: true, content: [{ type: 'text', text: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` }] };
+  }
 }

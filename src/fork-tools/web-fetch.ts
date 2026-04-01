@@ -100,12 +100,15 @@ export async function handleWebFetch(
     },
   ];
 
-  const resp = await ctx.chatCompletionStreaming(messages, {
-    temperature: route.hints.chatTemp,
-    maxTokens: max_tokens ?? ctx.adaptiveMaxTokens(plainText.length, route.contextLength),
-    model: route.modelId,
-    progressToken,
-  });
-
-  return { content: [{ type: 'text', text: resp.content + ctx.formatFooter(resp) }] };
+  try {
+    const resp = await ctx.chatCompletionStreaming(messages, {
+      temperature: route.hints.chatTemp,
+      maxTokens: max_tokens ?? ctx.adaptiveMaxTokens(plainText.length, route.contextLength),
+      model: route.modelId,
+      progressToken,
+    });
+    return { content: [{ type: 'text', text: resp.content + ctx.formatFooter(resp) }] };
+  } catch (err) {
+    return { isError: true, content: [{ type: 'text', text: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` }] };
+  }
 }

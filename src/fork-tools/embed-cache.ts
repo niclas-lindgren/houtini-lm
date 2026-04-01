@@ -14,6 +14,8 @@ const DB_DIR = join(homedir(), '.houtini-lm');
 const DB_PATH = join(DB_DIR, 'embed-cache.db');
 
 let db: Database | null = null;
+// Promise-singleton: prevents TOCTOU race when two callers hit initEmbedCache concurrently
+let initPromise: Promise<void> | null = null;
 
 export interface CachedChunk {
   chunk_idx: number;
@@ -21,9 +23,11 @@ export interface CachedChunk {
   vector: number[];
 }
 
-export async function initEmbedCache(): Promise<void> {
-  if (db) return;
+export function initEmbedCache(): Promise<void> {
+  return (initPromise ??= _init());
+}
 
+async function _init(): Promise<void> {
   const SQL = await initSqlJs();
 
   if (existsSync(DB_PATH)) {
@@ -48,8 +52,6 @@ export async function initEmbedCache(): Promise<void> {
       PRIMARY KEY (path, chunk_idx)
     )
   `);
-
-  saveDb();
 }
 
 function getDb(): Database {
@@ -59,7 +61,7 @@ function getDb(): Database {
 
 /**
  * Returns all cached chunks for a file if every chunk's mtime matches.
- * Returns null if any chunk is stale or the file has no cached chunks.
+ * Returns null if any chunk is stale, missing, or has a corrupted vector.
  */
 export function getCachedChunks(path: string, mtime: number): CachedChunk[] | null {
   const rows = getDb().exec(
@@ -72,7 +74,13 @@ export function getCachedChunks(path: string, mtime: number): CachedChunk[] | nu
   for (const row of rows[0].values) {
     const [chunk_idx, rowMtime, content, vectorJson] = row as [number, number, string, string];
     if (rowMtime !== mtime) return null; // stale — caller must re-embed
-    chunks.push({ chunk_idx, content, vector: JSON.parse(vectorJson) as number[] });
+    let vector: number[];
+    try {
+      vector = JSON.parse(vectorJson) as number[];
+    } catch {
+      return null; // corrupted row — force re-embed
+    }
+    chunks.push({ chunk_idx, content, vector });
   }
   return chunks;
 }
