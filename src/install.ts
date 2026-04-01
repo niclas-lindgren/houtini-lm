@@ -11,7 +11,8 @@
 
 import { readFile, writeFile, mkdir, access, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PASS = '\x1b[0;32m✓\x1b[0m';
 const SKIP = '\x1b[0;33m·\x1b[0m';
@@ -25,60 +26,7 @@ async function fileExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
 }
 
-const HOOK_AGENT_INJECT = `#!/bin/bash
-INPUT=$(cat)
-PROMPT=$(echo "$INPUT" | jq -r '.tool_input.prompt // ""')
-SUBAGENT_TYPE=$(echo "$INPUT" | jq -r '.tool_input.subagent_type // ""')
-if echo "$PROMPT" | grep -qE "houtini|code_task_files"; then
-  exit 0
-fi
-SUFFIX=$(printf '\\n\\nCRITICAL — use these houtini tools instead of native alternatives:\\n- Source files: mcp__houtini-lm__code_task_files(["/abs/path"], task) — NOT Read\\n- Web pages: mcp__houtini-lm__web_fetch(url, task) — NOT WebFetch\\n- Code search: mcp__houtini-lm__search_task(query, paths, task) — NOT Bash grep/find\\n- Quick Q&A: mcp__houtini-lm__chat(message) — NOT direct reasoning\\n- File writes: mcp__houtini-lm__code_write(path, instructions)\\n- Errors/stack traces: mcp__houtini-lm__explain_error(error, context?, language?)\\n- GitHub Actions failures: mcp__houtini-lm__ci_logs(repo, run_id?, job_id?)\\n- Concept search (when grep fails): mcp__houtini-lm__semantic_search(query, paths, task)\\nDo NOT use Read, WebFetch, or Bash grep/sed/awk/find for code or web content.')
-if [ "$SUBAGENT_TYPE" = "Explore" ]; then
-  echo "$INPUT" | jq --arg p "\${PROMPT}\${SUFFIX}" '.tool_input.prompt = $p | .tool_input.subagent_type = "general-purpose" | {hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:.tool_input}}'
-  exit 0
-fi
-echo "$INPUT" | jq --arg p "\${PROMPT}\${SUFFIX}" '.tool_input.prompt = $p | {hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:.tool_input}}'
-`;
-
-const HOOK_READ_GUARD = `#!/bin/bash
-INPUT=$(cat)
-FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
-# Allow bypass for specific directories (set HOUTINI_GUARD_EXCLUDE to a path prefix)
-if [ -n "$HOUTINI_GUARD_EXCLUDE" ] && [[ "$FILE" == "$HOUTINI_GUARD_EXCLUDE"* ]]; then exit 0; fi
-EXT="\${FILE##*.}"
-case "$EXT" in
-  # Binary/media -- let Claude read these directly
-  png|jpg|jpeg|gif|svg|ico|webp|bmp|tiff|\\
-  pdf|zip|tar|gz|bz2|xz|7z|\\
-  mp3|mp4|wav|mov|avi|\\
-  woff|woff2|ttf|eot|\\
-  so|dylib|dll|exe|bin|o|a)
-    exit 0
-    ;;
-  *)
-    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"Prefer mcp__houtini-lm__code_task_files([\\\"%s\\\"], task) over Read to keep source files out of context."}}\\n' "$FILE"
-    exit 0
-    ;;
-esac
-`;
-
-const HOOK_BASH_GUARD = `#!/bin/bash
-INPUT=$(cat)
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
-if ! echo "$CMD" | grep -qE '\\b(grep|rg|sed|awk|cat|head|tail)\\b'; then exit 0; fi
-if ! echo "$CMD" | grep -qE '\\.(ts|tsx|js|jsx|py|go|rs|sh|cs|java|rb|php|c|cpp|h)\\b'; then exit 0; fi
-printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"Prefer mcp__houtini-lm__code_task_files([paths], task) or mcp__houtini-lm__search_task(query, paths, task) over Bash grep/sed/awk/cat for source files — keeps content out of context."}}\\n'
-exit 0
-`;
-
-const HOOK_REMIND = `#!/bin/bash
-INPUT=$(cat)
-PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""')
-if echo "$PROMPT" | grep -qiE '\\b(explain|understand|what does|summarize|review|analyze|look at|check|read|write|create|implement|scaffold|locate)\\b|find all|which files'; then
-  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"HOUTINI REMINDER: use mcp__houtini-lm__code_task_files([paths], task) instead of Read for code comprehension. For file writes: mcp__houtini-lm__code_write(path, instructions). For search: mcp__houtini-lm__search_task(query, paths, task). For long output: mcp__houtini-lm__analyze_output(output, task). For web pages: mcp__houtini-lm__web_fetch(url, task) instead of WebFetch."}}'
-fi
-exit 0
-`;
+const HOOKS_SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), 'hooks');
 
 const HOOKS_CFG = {
   PreToolUse: [
@@ -91,12 +39,12 @@ const HOOKS_CFG = {
   ],
 };
 
-const HOOK_FILES: Record<string, string> = {
-  'houtini-agent-inject.sh': HOOK_AGENT_INJECT,
-  'houtini-read-guard.sh':   HOOK_READ_GUARD,
-  'houtini-bash-guard.sh':   HOOK_BASH_GUARD,
-  'houtini-remind.sh':       HOOK_REMIND,
-};
+const HOOK_NAMES = [
+  'houtini-agent-inject.sh',
+  'houtini-read-guard.sh',
+  'houtini-bash-guard.sh',
+  'houtini-remind.sh',
+];
 
 async function writeHook(hooksDir: string, filename: string, content: string, force = false) {
   const p = join(hooksDir, filename);
@@ -162,7 +110,8 @@ export async function runInstall(force = false) {
 
   await mkdir(hooksDir, { recursive: true });
 
-  for (const [filename, content] of Object.entries(HOOK_FILES)) {
+  for (const filename of HOOK_NAMES) {
+    const content = await readFile(join(HOOKS_SRC_DIR, filename), 'utf8');
     await writeHook(hooksDir, filename, content, force);
   }
   await patchSettings(settingsPath, force);
