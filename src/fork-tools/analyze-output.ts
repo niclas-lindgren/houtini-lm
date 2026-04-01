@@ -43,11 +43,12 @@ export async function handleAnalyzeOutput(
   };
 
   const route = await ctx.routeToModel('analysis');
+  const constraint = route.hints.outputConstraint ? `\n${route.hints.outputConstraint}` : '';
 
   const messages: ChatMessage[] = [
     {
       role: 'system',
-      content: 'You are a log analysis assistant. Extract only what the task asks for. Be concise and specific — include file names and line numbers where relevant.',
+      content: `You are a CLI output analyst. Extract only what the task asks for. Be concise and specific — include file names and line numbers where relevant.${constraint}`,
     },
     {
       role: 'user',

@@ -89,10 +89,11 @@ export async function handleWebFetch(
   const plainText = stripHtml(rawBody).slice(0, MAX_PAGE_CHARS);
 
   const route = await ctx.routeToModel('analysis');
+  const constraint = route.hints.outputConstraint ? `\n${route.hints.outputConstraint}` : '';
   const messages = [
     {
       role: 'system' as const,
-      content: `You extract and summarize web page content. Be concise and factual. Answer only what is asked — do not pad.`,
+      content: `You extract information from web page content. Be concise and factual. Answer only what is asked — do not pad. If the requested information is not present on the page, say so explicitly.${constraint}`,
     },
     {
       role: 'user' as const,
