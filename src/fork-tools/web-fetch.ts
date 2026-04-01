@@ -31,6 +31,16 @@ export const WEB_FETCH_TOOL = {
 const FETCH_TIMEOUT_MS = 30_000;
 const MAX_PAGE_CHARS = 120_000; // ~30k tokens — truncate before sending to LLM
 
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function stripHtml(html: string): string {
   // Remove script/style blocks entirely
   let text = html
@@ -62,13 +72,11 @@ export async function handleWebFetch(
   // Fetch with timeout
   let rawBody: string;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const resp = await fetch(url, {
-      signal: controller.signal,
-      headers: { 'User-Agent': 'houtini-lm/1.0 (summary bot)' },
-    });
-    clearTimeout(timer);
+    const resp = await fetchWithTimeout(
+      url,
+      { headers: { 'User-Agent': 'houtini-lm/1.0 (summary bot)' } },
+      FETCH_TIMEOUT_MS,
+    );
     if (!resp.ok) {
       return { isError: true, content: [{ type: 'text', text: `HTTP ${resp.status} ${resp.statusText} — ${url}` }] };
     }

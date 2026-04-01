@@ -1,5 +1,5 @@
 import type { ForkContext, ChatMessage, ToolResult } from './types.js';
-import { normalizePathsSync } from '../normalize-paths.js';
+import { normalizePaths } from '../normalize-paths.js';
 
 export const SEARCH_TASK_TOOL = {
   name: 'search_task',
@@ -48,7 +48,7 @@ export async function handleSearchTask(
     task: string;
     file_glob?: string;
   };
-  const searchPaths = normalizePathsSync(rawSearchPaths);
+  const searchPaths = await normalizePaths(rawSearchPaths);
 
   const grepArgs = ['-rn'];
   if (file_glob) grepArgs.push(`--include=${file_glob}`);
