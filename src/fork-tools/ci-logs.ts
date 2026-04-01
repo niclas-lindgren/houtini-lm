@@ -41,7 +41,6 @@ export const CI_LOGS_TOOL = {
 
 const DEFAULT_FILTER = 'Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
 const MAX_LOG_LINES = 400;
-const MAX_LOG_CHARS = 60_000; // ~15k tokens — safe for most local models
 
 export async function handleCiLogs(
   args: unknown,
@@ -126,12 +125,15 @@ export async function handleCiLogs(
     filteredLog = capped.join('\n');
   }
 
-  // Hard cap on characters to stay within local model context limits
-  if (filteredLog.length > MAX_LOG_CHARS) {
-    filteredLog = filteredLog.slice(0, MAX_LOG_CHARS) + `\n... (truncated at ${MAX_LOG_CHARS} chars)`;
-  }
-
   const route = await ctx.routeToModel('analysis');
+
+  // Tail-based truncation: keep the end of the log (failures appear last)
+  // Reserve ~300 tokens for system prompt + 512 for response; 3 chars/token conservative estimate
+  const logCharBudget = Math.max(10_000, (route.contextLength - 812) * 3);
+  if (filteredLog.length > logCharBudget) {
+    filteredLog = `... (truncated ${filteredLog.length - logCharBudget} chars from start)\n` +
+      filteredLog.slice(-logCharBudget);
+  }
   const target = job_id ? `job ${job_id}` : `run ${run_id}`;
   const systemContent = [
     'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:',
