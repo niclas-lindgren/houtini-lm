@@ -47,6 +47,10 @@ export const CI_LOGS_TOOL = {
         type: 'number',
         description: 'Lines of context to include around each match. Default: 3.',
       },
+      debug: {
+        type: 'boolean',
+        description: 'When true, append the filtered log sent to the LLM after the analysis. Useful for verifying the LLM is not hallucinating.',
+      },
     },
     required: [],
   },
@@ -105,6 +109,7 @@ export async function handleCiLogs(
     runs: wantedRuns = 1,
     filter,
     context_lines,
+    debug = false,
   } = args as {
     repo?: string;
     run_id?: string;
@@ -114,6 +119,7 @@ export async function handleCiLogs(
     runs?: number;
     filter?: string;
     context_lines?: number;
+    debug?: boolean;
   };
 
   const repoArgs = repo ? ['--repo', repo] : [];
@@ -248,12 +254,15 @@ export async function handleCiLogs(
       model: route.modelId,
       progressToken,
     });
+    const footer = `\n\n(${totalMatchCount} matched lines from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
+      ctx.formatFooter(resp);
+    const debugSection = debug
+      ? `\n\n---\n**Debug — filtered log sent to LLM (${combinedLog.length} chars):**\n\`\`\`\n${combinedLog}\n\`\`\``
+      : '';
     return {
       content: [{
         type: 'text',
-        text: resp.content +
-          `\n\n(${totalMatchCount} matched lines from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
-          ctx.formatFooter(resp),
+        text: resp.content + footer + debugSection,
       }],
     };
   } catch (err) {
