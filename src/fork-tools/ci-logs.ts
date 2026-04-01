@@ -56,7 +56,7 @@ export const CI_LOGS_TOOL = {
   },
 };
 
-const DEFAULT_FILTER = 'Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
+const DEFAULT_FILTER = '##\\[error\\]|##\\[warning\\]|Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
 
 function filterLines(raw: string, re: RegExp, ctxLines: number): { filtered: string; matchCount: number } {
   const allLines = raw.split('\n');
@@ -133,7 +133,7 @@ export async function handleCiLogs(
     return { isError: true, content: [{ type: 'text', text: `Invalid filter regex: ${pattern}` }] };
   }
 
-  const ctxLines = context_lines ?? 3;
+  const ctxLines = context_lines ?? 5;
   const runCount = Math.min(Math.max(1, wantedRuns), 3);
 
   // Resolve which runs to analyze
@@ -217,7 +217,8 @@ export async function handleCiLogs(
       continue;
     }
 
-    const { filtered, matchCount } = filterLines(rawLog, filterRe, ctxLines);
+    const cleanLog = rawLog.replace(/\x1b\[[0-9;]*m/g, '');
+    const { filtered, matchCount } = filterLines(cleanLog, filterRe, ctxLines);
     totalMatchCount += matchCount;
     const budgeted = applyCharBudget(filtered, perRunBudget);
     sections.push(targets.length > 1 ? `## ${label}\n${budgeted}` : budgeted);
@@ -233,7 +234,7 @@ export async function handleCiLogs(
   const systemContent = [
     isMultiRun
       ? 'You are a CI failure analyst reviewing multiple runs. First identify: are failures consistent across all runs (systemic) or only in some (flaky)? Then provide root cause and fix.'
-      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.',
+      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why, referencing the step name from ##[group] headers where visible\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.',
     route.hints.outputConstraint ?? '',
   ].filter(Boolean).join('\n');
 
