@@ -9,7 +9,8 @@ export const CI_LOGS_TOOL = {
     '\u2022 A CI run or job has failed and you want to know why\n' +
     '\u2022 Build/test output is too large to paste directly\n\n' +
     'TIPS:\n' +
-    '\u2022 Provide job_id alone for a specific job\'s full logs, or run_id alone for all failed steps\n' +
+    '\u2022 Omit run_id/job_id to auto-find the latest failed run (optionally filter by workflow/branch)\n' +
+    '\u2022 Use runs: 2-3 to detect flaky failures vs. consistently broken\n' +
     '\u2022 Override filter to match language-specific patterns (e.g. "panic:|FAIL " for Go)',
   inputSchema: {
     type: 'object' as const,
@@ -20,11 +21,23 @@ export const CI_LOGS_TOOL = {
       },
       run_id: {
         type: 'string',
-        description: 'GitHub Actions run ID. Use for all failed steps of a run. Provide this or job_id.',
+        description: 'GitHub Actions run ID. Use for all failed steps of a specific run.',
       },
       job_id: {
         type: 'string',
-        description: 'GitHub Actions job ID. Returns full logs for that job only. Provide this or run_id.',
+        description: 'GitHub Actions job ID. Returns full logs for that job only.',
+      },
+      workflow: {
+        type: 'string',
+        description: 'Workflow file name (e.g. "ci.yml"). Auto-finds the latest failed run when run_id is omitted.',
+      },
+      branch: {
+        type: 'string',
+        description: 'Branch to filter by when auto-resolving runs. Only used when run_id is omitted.',
+      },
+      runs: {
+        type: 'number',
+        description: 'Number of recent failed runs to analyze (1–3). Default 1. Use 2–3 to detect flaky vs. consistently broken.',
       },
       filter: {
         type: 'string',
@@ -40,69 +53,14 @@ export const CI_LOGS_TOOL = {
 };
 
 const DEFAULT_FILTER = 'Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
-const MAX_LOG_LINES = 400;
 
-export async function handleCiLogs(
-  args: unknown,
-  ctx: ForkContext,
-  progressToken?: string | number,
-): Promise<ToolResult> {
-  const { repo, run_id, job_id, filter, context_lines } = args as {
-    repo?: string;
-    run_id?: string;
-    job_id?: string;
-    filter?: string;
-    context_lines?: number;
-  };
-
-  if (!run_id && !job_id) {
-    return { isError: true, content: [{ type: 'text', text: 'Provide either run_id or job_id.' }] };
-  }
-
-  // Build gh command:
-  // - job_id alone: gh run view --log [--repo REPO] --job JOB_ID  (full job log, no --log-failed)
-  // - run_id (with optional job_id filter): gh run view RUN_ID --log-failed [--repo REPO]
-  // repo is optional — when omitted, gh infers from the current git remote
-  const repoArgs = repo ? ['--repo', repo] : [];
-  let ghArgs: string[];
-  if (job_id && !run_id) {
-    ghArgs = ['run', 'view', '--log', ...repoArgs, '--job', job_id];
-  } else if (job_id && run_id) {
-    ghArgs = ['run', 'view', run_id, '--log', ...repoArgs, '--job', job_id];
-  } else {
-    ghArgs = ['run', 'view', run_id!, '--log-failed', ...repoArgs];
-  }
-
-  let rawLog: string;
-  try {
-    const { stdout } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 });
-    rawLog = stdout;
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { isError: true, content: [{ type: 'text', text: `gh failed: ${msg}` }] };
-  }
-
-  if (!rawLog.trim()) {
-    return { content: [{ type: 'text', text: 'No failed-step logs found — the run may have succeeded or logs may have expired.' }] };
-  }
-
-  // Compile filter regex safely
-  const pattern = filter ?? DEFAULT_FILTER;
-  let filterRe: RegExp;
-  try {
-    filterRe = new RegExp(pattern, 'i');
-  } catch {
-    return { isError: true, content: [{ type: 'text', text: `Invalid filter regex: ${pattern}` }] };
-  }
-
-  // Filter to failure-signal lines with context, deduplicating overlapping windows
-  const ctxLines = context_lines ?? 3;
-  const allLines = rawLog.split('\n');
+function filterLines(raw: string, re: RegExp, ctxLines: number): { filtered: string; matchCount: number } {
+  const allLines = raw.split('\n');
   const matched: string[] = [];
   let lastEnd = -1;
 
   for (let i = 0; i < allLines.length; i++) {
-    if (filterRe.test(allLines[i])) {
+    if (re.test(allLines[i])) {
       const start = Math.max(lastEnd + 1, i - ctxLines);
       const end = Math.min(allLines.length - 1, i + ctxLines);
       if (matched.length > 0 && start > lastEnd + 1) matched.push('---');
@@ -113,57 +71,189 @@ export async function handleCiLogs(
   }
 
   const matchCount = matched.filter((l) => l !== '---').length;
-  let filteredLog: string;
-
   if (matched.length === 0) {
-    const tail = allLines.slice(-MAX_LOG_LINES);
-    filteredLog = `(no lines matched filter — showing last ${tail.length} lines)\n` + tail.join('\n');
-  } else {
-    const capped = matched.length > MAX_LOG_LINES
-      ? matched.slice(0, MAX_LOG_LINES).concat([`... (truncated at ${MAX_LOG_LINES} of ${matched.length} lines)`])
-      : matched;
-    filteredLog = capped.join('\n');
+    const tail = allLines.slice(-400);
+    return {
+      filtered: `(no lines matched filter — showing last ${tail.length} lines)\n` + tail.join('\n'),
+      matchCount: 0,
+    };
   }
+  return { filtered: matched.join('\n'), matchCount };
+}
+
+// Preserve head (job/step context) + tail (failure output) when log exceeds budget.
+// 10% head keeps the step header that identifies which job failed; 90% tail captures error messages.
+function applyCharBudget(log: string, budget: number): string {
+  if (log.length <= budget) return log;
+  const headBudget = Math.floor(budget * 0.10);
+  const tailBudget = budget - headBudget;
+  const omitted = log.length - budget;
+  return log.slice(0, headBudget) + `\n\n...(${omitted} chars omitted)...\n\n` + log.slice(-tailBudget);
+}
+
+export async function handleCiLogs(
+  args: unknown,
+  ctx: ForkContext,
+  progressToken?: string | number,
+): Promise<ToolResult> {
+  const {
+    repo,
+    run_id,
+    job_id,
+    workflow,
+    branch,
+    runs: wantedRuns = 1,
+    filter,
+    context_lines,
+  } = args as {
+    repo?: string;
+    run_id?: string;
+    job_id?: string;
+    workflow?: string;
+    branch?: string;
+    runs?: number;
+    filter?: string;
+    context_lines?: number;
+  };
+
+  const repoArgs = repo ? ['--repo', repo] : [];
+
+  // Compile filter regex
+  const pattern = filter ?? DEFAULT_FILTER;
+  let filterRe: RegExp;
+  try {
+    filterRe = new RegExp(pattern, 'i');
+  } catch {
+    return { isError: true, content: [{ type: 'text', text: `Invalid filter regex: ${pattern}` }] };
+  }
+
+  const ctxLines = context_lines ?? 3;
+  const runCount = Math.min(Math.max(1, wantedRuns), 3);
+
+  // Resolve which runs to analyze
+  type RunTarget = { id: string; title: string; runBranch: string };
+  let resolvedRuns: RunTarget[];
+
+  if (job_id) {
+    resolvedRuns = [];  // job_id path bypasses run resolution
+  } else if (run_id) {
+    resolvedRuns = [{ id: run_id, title: run_id, runBranch: branch ?? '' }];
+  } else {
+    // Auto-resolve: find the N most recent failed runs via gh run list
+    const listArgs = [
+      'run', 'list',
+      '--json', 'databaseId,displayTitle,headBranch',
+      '--status', 'failure',
+      '--limit', String(runCount * 3),
+      ...repoArgs,
+    ];
+    if (workflow) listArgs.push('--workflow', workflow);
+    if (branch)   listArgs.push('--branch', branch);
+
+    let listStdout: string;
+    try {
+      ({ stdout: listStdout } = await ctx.execFileAsync('gh', listArgs, { timeout: 20_000, maxBuffer: 1024 * 1024 }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { isError: true, content: [{ type: 'text', text: `gh run list failed: ${msg}` }] };
+    }
+
+    let failedRuns: Array<{ databaseId: number; displayTitle: string; headBranch: string }>;
+    try {
+      failedRuns = JSON.parse(listStdout);
+    } catch {
+      return { isError: true, content: [{ type: 'text', text: 'Failed to parse gh run list output.' }] };
+    }
+
+    const selected = failedRuns.slice(0, runCount);
+    if (selected.length === 0) {
+      const what = [workflow && `workflow "${workflow}"`, branch && `branch "${branch}"`].filter(Boolean).join(', ');
+      return { content: [{ type: 'text', text: `No failed runs found${what ? ` for ${what}` : ''}.` }] };
+    }
+    resolvedRuns = selected.map((r) => ({ id: String(r.databaseId), title: r.displayTitle, runBranch: r.headBranch }));
+  }
+
+  // Determine gh invocations
+  type GhTarget = { ghArgs: string[]; label: string };
+  const targets: GhTarget[] = job_id
+    ? [{
+        ghArgs: run_id
+          ? ['run', 'view', run_id, '--log', ...repoArgs, '--job', job_id]
+          : ['run', 'view', '--log', ...repoArgs, '--job', job_id],
+        label: `job ${job_id}`,
+      }]
+    : resolvedRuns.map((r) => ({
+        ghArgs: ['run', 'view', r.id, '--log-failed', ...repoArgs],
+        label: resolvedRuns.length > 1 ? `run ${r.id} — ${r.title} (${r.runBranch})` : `run ${r.id}`,
+      }));
 
   const route = await ctx.routeToModel('analysis');
+  const totalCharBudget = Math.max(10_000, (route.contextLength - 812) * 3);
+  const perRunBudget = Math.floor(totalCharBudget / targets.length);
 
-  // Tail-based truncation: keep the end of the log (failures appear last)
-  // Reserve ~300 tokens for system prompt + 512 for response; 3 chars/token conservative estimate
-  const logCharBudget = Math.max(10_000, (route.contextLength - 812) * 3);
-  if (filteredLog.length > logCharBudget) {
-    filteredLog = `... (truncated ${filteredLog.length - logCharBudget} chars from start)\n` +
-      filteredLog.slice(-logCharBudget);
+  const sections: string[] = [];
+  let totalMatchCount = 0;
+
+  for (const { ghArgs, label } of targets) {
+    let rawLog: string;
+    try {
+      ({ stdout: rawLog } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      sections.push(targets.length > 1 ? `## ${label}\n(fetch failed: ${msg})` : `fetch failed: ${msg}`);
+      continue;
+    }
+
+    if (!rawLog.trim()) {
+      sections.push(targets.length > 1
+        ? `## ${label}\n(no output — run may have succeeded or logs may have expired)`
+        : 'No failed-step logs found — the run may have succeeded or logs may have expired.');
+      continue;
+    }
+
+    const { filtered, matchCount } = filterLines(rawLog, filterRe, ctxLines);
+    totalMatchCount += matchCount;
+    const budgeted = applyCharBudget(filtered, perRunBudget);
+    sections.push(targets.length > 1 ? `## ${label}\n${budgeted}` : budgeted);
   }
-  const target = job_id ? `job ${job_id}` : `run ${run_id}`;
+
+  if (sections.length === 0) {
+    return { content: [{ type: 'text', text: 'No logs could be fetched.' }] };
+  }
+
+  const combinedLog = sections.join('\n\n---\n\n');
+  const isMultiRun = resolvedRuns.length > 1;
+
   const systemContent = [
-    'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:',
-    '1. Root cause — what failed and why',
-    '2. Fix — the specific change needed',
-    '3. If relevant: what to verify after applying the fix',
-    'Be concise. Reference step names and line numbers where visible.',
+    isMultiRun
+      ? 'You are a CI failure analyst reviewing multiple runs. First identify: are failures consistent across all runs (systemic) or only in some (flaky)? Then provide root cause and fix.'
+      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.',
     route.hints.outputConstraint ?? '',
   ].filter(Boolean).join('\n');
 
   const repoLine = repo ? `Repository: ${repo}\n` : '';
+  const targetLabel = job_id ? `job ${job_id}` : resolvedRuns.map((r) => r.id).join(', ');
   const messages: ChatMessage[] = [
     { role: 'system', content: systemContent },
     {
       role: 'user',
-      content: `${repoLine}Target: ${target}\n\nFiltered log (${matchCount} matching lines):\n\`\`\`\n${filteredLog}\n\`\`\``,
+      content: `${repoLine}Target: ${targetLabel}\n\nFiltered log (${totalMatchCount} matching lines):\n\`\`\`\n${combinedLog}\n\`\`\``,
     },
   ];
 
   try {
     const resp = await ctx.chatCompletionStreaming(messages, {
       temperature: route.hints.chatTemp,
-      maxTokens: ctx.adaptiveMaxTokens(filteredLog.length, route.contextLength),
+      maxTokens: ctx.adaptiveMaxTokens(combinedLog.length, route.contextLength),
       model: route.modelId,
       progressToken,
     });
     return {
       content: [{
         type: 'text',
-        text: resp.content + `\n\n(${matchCount} matched lines from ${job_id ? 'job' : 'run'} logs)` + ctx.formatFooter(resp),
+        text: resp.content +
+          `\n\n(${totalMatchCount} matched lines from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
+          ctx.formatFooter(resp),
       }],
     };
   } catch (err) {
