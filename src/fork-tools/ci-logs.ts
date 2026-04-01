@@ -6,6 +6,7 @@ export const CI_LOGS_TOOL = {
     'Fetch GitHub Actions logs and diagnose failures using the local LLM — without raw logs entering Claude\'s context window.\n\n' +
     'Requires the `gh` CLI to be authenticated.\n\n' +
     'WHEN TO USE:\n' +
+    '\u2022 Use INSTEAD of `gh run view --log` or `gh run view --log-failed` — raw logs will flood Claude\'s context\n' +
     '\u2022 A CI run or job has failed and you want to know why\n' +
     '\u2022 Build/test output is too large to paste directly\n\n' +
     'TIPS:\n' +
@@ -234,7 +235,7 @@ export async function handleCiLogs(
   const systemContent = [
     isMultiRun
       ? 'You are a CI failure analyst reviewing multiple runs. First identify: are failures consistent across all runs (systemic) or only in some (flaky)? Then provide root cause and fix.'
-      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why, referencing the step name from ##[group] headers where visible\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.',
+      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why, referencing the step name from ##[group] headers where visible\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.\nOnly reference information explicitly present in the log excerpt. If the root cause is not visible in the excerpt, say so — do not invent error messages, file paths, or fixes.',
     route.hints.outputConstraint ?? '',
   ].filter(Boolean).join('\n');
 
