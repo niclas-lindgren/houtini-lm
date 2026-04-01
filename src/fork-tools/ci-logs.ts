@@ -16,7 +16,7 @@ export const CI_LOGS_TOOL = {
     properties: {
       repo: {
         type: 'string',
-        description: 'Repository in owner/repo format, e.g. "acme/my-app".',
+        description: 'Repository in owner/repo format, e.g. "acme/my-app". Optional — omit to auto-detect from the current git remote.',
       },
       run_id: {
         type: 'string',
@@ -35,7 +35,7 @@ export const CI_LOGS_TOOL = {
         description: 'Lines of context to include around each match. Default: 3.',
       },
     },
-    required: ['repo'],
+    required: [],
   },
 };
 
@@ -48,7 +48,7 @@ export async function handleCiLogs(
   progressToken?: string | number,
 ): Promise<ToolResult> {
   const { repo, run_id, job_id, filter, context_lines } = args as {
-    repo: string;
+    repo?: string;
     run_id?: string;
     job_id?: string;
     filter?: string;
@@ -60,15 +60,17 @@ export async function handleCiLogs(
   }
 
   // Build gh command:
-  // - job_id alone: gh run view --log --repo REPO --job JOB_ID  (full job log, no --log-failed)
-  // - run_id (with optional job_id filter): gh run view RUN_ID --log-failed --repo REPO
+  // - job_id alone: gh run view --log [--repo REPO] --job JOB_ID  (full job log, no --log-failed)
+  // - run_id (with optional job_id filter): gh run view RUN_ID --log-failed [--repo REPO]
+  // repo is optional — when omitted, gh infers from the current git remote
+  const repoArgs = repo ? ['--repo', repo] : [];
   let ghArgs: string[];
   if (job_id && !run_id) {
-    ghArgs = ['run', 'view', '--log', '--repo', repo, '--job', job_id];
+    ghArgs = ['run', 'view', '--log', ...repoArgs, '--job', job_id];
   } else if (job_id && run_id) {
-    ghArgs = ['run', 'view', run_id, '--log', '--repo', repo, '--job', job_id];
+    ghArgs = ['run', 'view', run_id, '--log', ...repoArgs, '--job', job_id];
   } else {
-    ghArgs = ['run', 'view', run_id!, '--log-failed', '--repo', repo];
+    ghArgs = ['run', 'view', run_id!, '--log-failed', ...repoArgs];
   }
 
   let rawLog: string;
