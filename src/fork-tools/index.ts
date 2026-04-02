@@ -4,7 +4,6 @@ import { ANALYZE_OUTPUT_TOOL, handleAnalyzeOutput } from './analyze-output.js';
 import { SEARCH_TASK_TOOL, handleSearchTask } from './search-task.js';
 import { WEB_FETCH_TOOL, handleWebFetch } from './web-fetch.js';
 import { EXPLAIN_ERROR_TOOL, handleExplainError } from './explain-error.js';
-import { CI_LOGS_TOOL, handleCiLogs } from './ci-logs.js';
 import { SEMANTIC_SEARCH_TOOL, handleSemanticSearch } from './semantic-search.js';
 import type { ForkContext, ToolResult } from './types.js';
 
@@ -17,7 +16,6 @@ export const FORK_TOOLS = [
   SEARCH_TASK_TOOL,
   WEB_FETCH_TOOL,
   EXPLAIN_ERROR_TOOL,
-  CI_LOGS_TOOL,
   SEMANTIC_SEARCH_TOOL,
 ];
 
@@ -34,7 +32,6 @@ export async function handleForkTool(
     case 'search_task':    return handleSearchTask(args, ctx, progressToken);
     case 'web_fetch':      return handleWebFetch(args, ctx, progressToken);
     case 'explain_error':  return handleExplainError(args, ctx, progressToken);
-    case 'ci_logs':          return handleCiLogs(args, ctx, progressToken);
     case 'semantic_search':  return handleSemanticSearch(args, ctx, progressToken);
     default:                 return null;
   }
