@@ -58,6 +58,10 @@ export const CI_LOGS_TOOL = {
 };
 
 const DEFAULT_FILTER = '##\\[error\\]|##\\[warning\\]|Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
+const ERRORS_ONLY_FILTER = '##\\[error\\]|Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
+const ESCALATION_THRESHOLD = 150; // lines — when exceeded with default filter, drop ##[warning] and re-filter
+const LINE_CAP = 250;             // max lines sent to LLM — head+tail split when exceeded
+const CI_ANALYSIS_MAX_TOKENS = 600;
 
 function filterLines(raw: string, re: RegExp, ctxLines: number): { filtered: string; matchCount: number } {
   const allLines = raw.split('\n');
@@ -86,6 +90,41 @@ function filterLines(raw: string, re: RegExp, ctxLines: number): { filtered: str
   return { filtered: matched.join('\n'), matchCount };
 }
 
+/**
+ * Discard log sections from CI steps that contain no error-matching lines.
+ * GitHub Actions annotates steps with ##[group]<name> ... ##[endgroup].
+ * Sections outside any group (runner preamble/metadata) are kept unconditionally.
+ * Falls back to the original log if no group markers are present.
+ */
+function filterByGroup(raw: string, re: RegExp): string {
+  if (!raw.includes('##[group]')) return raw;
+  const lines = raw.split('\n');
+  const out: string[] = [];
+  let inGroup = false;
+  let groupHasError = false;
+  let groupLines: string[] = [];
+
+  for (const line of lines) {
+    if (line.includes('##[group]')) {
+      inGroup = true;
+      groupHasError = false;
+      groupLines = [line];
+    } else if (line.includes('##[endgroup]')) {
+      groupLines.push(line);
+      if (groupHasError) out.push(...groupLines);
+      inGroup = false;
+      groupLines = [];
+    } else if (inGroup) {
+      groupLines.push(line);
+      if (re.test(line)) groupHasError = true;
+    } else {
+      out.push(line);
+    }
+  }
+  if (groupLines.length > 0 && groupHasError) out.push(...groupLines);
+  return out.join('\n');
+}
+
 // Preserve head (job/step context) + tail (failure output) when log exceeds budget.
 // 10% head keeps the step header that identifies which job failed; 90% tail captures error messages.
 function applyCharBudget(log: string, budget: number): string {
@@ -94,6 +133,52 @@ function applyCharBudget(log: string, budget: number): string {
   const tailBudget = budget - headBudget;
   const omitted = log.length - budget;
   return log.slice(0, headBudget) + `\n\n...(${omitted} chars omitted)...\n\n` + log.slice(-tailBudget);
+}
+
+/** Keep first 1/3 + last 2/3 of lines when the filtered log exceeds maxLines. */
+function capLines(log: string, maxLines: number): string {
+  const lines = log.split('\n');
+  if (lines.length <= maxLines) return log;
+  const headCount = Math.floor(maxLines / 3);
+  const tailCount = maxLines - headCount;
+  const omitted = lines.length - maxLines;
+  return [
+    ...lines.slice(0, headCount),
+    `...(${omitted} lines omitted)...`,
+    ...lines.slice(lines.length - tailCount),
+  ].join('\n');
+}
+
+/** Collapse repeated error patterns — strips timestamps/coords for grouping, annotates repeats with ×N. */
+function deduplicateLines(log: string): string {
+  const normalize = (line: string): string =>
+    line
+      .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, '<ts>')
+      .replace(/0x[0-9a-fA-F]+/g, '<hex>')
+      .replace(/:\d+:\d+/g, ':<loc>')
+      .replace(/\b\d+\b/g, '<n>')
+      .trim();
+
+  const lines = log.split('\n');
+  const counts = new Map<string, { first: string; count: number }>();
+  const order: string[] = [];
+
+  for (const line of lines) {
+    const key = normalize(line);
+    if (counts.has(key)) {
+      counts.get(key)!.count++;
+    } else {
+      counts.set(key, { first: line, count: 1 });
+      order.push(key);
+    }
+  }
+
+  return order
+    .map((key) => {
+      const { first, count } = counts.get(key)!;
+      return count > 1 ? `${first}  (×${count})` : first;
+    })
+    .join('\n');
 }
 
 export async function handleCiLogs(
@@ -134,7 +219,7 @@ export async function handleCiLogs(
     return { isError: true, content: [{ type: 'text', text: `Invalid filter regex: ${pattern}` }] };
   }
 
-  const ctxLines = context_lines ?? 5;
+  const ctxLines = context_lines ?? 3;
   const runCount = Math.min(Math.max(1, wantedRuns), 3);
 
   // Resolve which runs to analyze
@@ -195,7 +280,7 @@ export async function handleCiLogs(
       }));
 
   const route = await ctx.routeToModel('analysis');
-  const totalCharBudget = Math.max(10_000, (route.contextLength - 812) * 3);
+  const totalCharBudget = Math.min(Math.max(10_000, (route.contextLength - 812) * 2), 50_000);
   const perRunBudget = Math.floor(totalCharBudget / targets.length);
 
   const sections: string[] = [];
@@ -219,9 +304,19 @@ export async function handleCiLogs(
     }
 
     const cleanLog = rawLog.replace(/\x1b\[[0-9;]*m/g, '');
-    const { filtered, matchCount } = filterLines(cleanLog, filterRe, ctxLines);
+    const groupFiltered = filterByGroup(cleanLog, filterRe);
+    let { filtered, matchCount } = filterLines(groupFiltered, filterRe, ctxLines);
+    // Auto-escalate: when warning spam dominates, re-filter with errors-only and take the smaller result
+    if (matchCount > ESCALATION_THRESHOLD && !filter) {
+      const errorsOnlyRe = new RegExp(ERRORS_ONLY_FILTER, 'i');
+      const { filtered: escalated, matchCount: escalatedCount } = filterLines(groupFiltered, errorsOnlyRe, ctxLines);
+      if (escalatedCount < matchCount) {
+        filtered = escalated;
+        matchCount = escalatedCount;
+      }
+    }
     totalMatchCount += matchCount;
-    const budgeted = applyCharBudget(filtered, perRunBudget);
+    const budgeted = applyCharBudget(capLines(deduplicateLines(filtered), LINE_CAP), perRunBudget);
     sections.push(targets.length > 1 ? `## ${label}\n${budgeted}` : budgeted);
   }
 
@@ -252,7 +347,7 @@ export async function handleCiLogs(
   try {
     const resp = await ctx.chatCompletionStreaming(messages, {
       temperature: route.hints.chatTemp,
-      maxTokens: ctx.adaptiveMaxTokens(combinedLog.length, route.contextLength),
+      maxTokens: Math.min(ctx.adaptiveMaxTokens(combinedLog.length, route.contextLength), CI_ANALYSIS_MAX_TOKENS),
       model: route.modelId,
       progressToken,
     });
