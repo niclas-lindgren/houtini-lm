@@ -109,7 +109,7 @@ const ERRORS_ONLY_FILTER =
   '|Bundler::GemNotFound|could not load such file';
 const ESCALATION_THRESHOLD = 150; // lines — when exceeded with default filter, drop ##[warning] and re-filter
 const LINE_CAP = 250;             // max lines for the regex-fallback path
-const CI_ANALYSIS_MAX_TOKENS = 3000;
+const CI_ANALYSIS_MAX_TOKENS = 8000;
 const MAX_LOG_BUDGET = 150_000;   // total chars across all sections sent to the analysis LLM
 const SEMANTIC_RANKING_THRESHOLD = 8;   // only rank when section count exceeds this
 const SEMANTIC_TOP_K = 8;               // sections to keep after ranking
@@ -450,8 +450,11 @@ export async function handleCiLogs(
       if (!resp.content.trim()) {
         const hint = assembled.length < 300
           ? 'The log file appears to contain only an error message — the download likely failed.'
-          : 'The LLM may have exhausted its token budget on reasoning without producing output. Retry with debug:true to inspect what was sent to the LLM.';
-        return { isError: true, content: [{ type: 'text', text: `CI analysis returned no content. ${hint}` }] };
+          : 'The LLM exhausted its token budget on reasoning without producing output (think-block model with stale cache). The assembled log is shown below.';
+        const debugDump = debug || assembled.length < 300
+          ? `\n\nAssembled log (${assembled.length} chars):\n\`\`\`\n${assembled.slice(0, 4000)}${assembled.length > 4000 ? '\n...(truncated)' : ''}\n\`\`\``
+          : ' Retry with debug:true to inspect what was sent to the LLM.';
+        return { isError: true, content: [{ type: 'text', text: `CI analysis returned no content. ${hint}${debugDump}` }] };
       }
       const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from log file)` + ctx.formatFooter(resp);
       const DEBUG_PREVIEW = 8_000;
