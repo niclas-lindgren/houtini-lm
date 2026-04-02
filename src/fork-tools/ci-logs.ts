@@ -1,6 +1,11 @@
+import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import type { ForkContext, ToolResult } from './types.js';
+import { isSafeGhCommand } from './gh-safe.js';
+
+const SAFE_RUN_ID = /^\d+$/;
+const SAFE_REPO   = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
 export const CI_LOGS_TOOL = {
   name: 'ci_logs',
@@ -309,6 +314,13 @@ export async function handleCiLogs(
     log_file?: string;
   };
 
+  if (run_id && !SAFE_RUN_ID.test(run_id))
+    return { isError: true, content: [{ type: 'text', text: `Invalid run_id: must be numeric` }] };
+  if (job_id && !SAFE_RUN_ID.test(job_id))
+    return { isError: true, content: [{ type: 'text', text: `Invalid job_id: must be numeric` }] };
+  if (repo && !SAFE_REPO.test(repo))
+    return { isError: true, content: [{ type: 'text', text: `Invalid repo: must be "owner/repo" with alphanumeric, hyphens, dots, or underscores` }] };
+
   const repoArgs = repo ? ['--repo', repo] : [];
 
   // Compile filter regex (needed for analyze mode)
@@ -332,7 +344,7 @@ export async function handleCiLogs(
     } catch (err) {
       return { isError: true, content: [{ type: 'text', text: `Could not read log_file: ${err instanceof Error ? err.message : String(err)}` }] };
     }
-    try { await ctx.writeFile(log_file, '', 'utf8'); } catch { /* best-effort delete */ }
+    try { await fs.unlink(log_file); } catch { /* best-effort delete */ }
 
     const route = await ctx.routeToModel('analysis');
     const cleanLog = rawLog
@@ -402,6 +414,9 @@ export async function handleCiLogs(
     if (workflow) listArgs.push('--workflow', workflow);
     if (branch)   listArgs.push('--branch', branch);
 
+    if (!isSafeGhCommand(['gh', ...listArgs]))
+      return { isError: true, content: [{ type: 'text', text: 'Internal error: unsafe gh run list command blocked' }] };
+
     let listStdout: string;
     try {
       ({ stdout: listStdout } = await ctx.execFileAsync('gh', listArgs, { timeout: 20_000, maxBuffer: 1024 * 1024 }));
@@ -421,10 +436,17 @@ export async function handleCiLogs(
   }
 
   const tmpFile = `/tmp/ci_${runId ?? job_id}.txt`;
-  const repoFlag = repo ? ` --repo ${repo}` : '';
-  const ghCmd = job_id
-    ? `gh run view${runId ? ` ${runId}` : ''} --log --job ${job_id}${repoFlag} > ${tmpFile}`
-    : `gh run view ${runId} --log-failed${repoFlag} > ${tmpFile}`;
+
+  const downloadArgs: string[] = ['run', 'view'];
+  if (runId) downloadArgs.push(runId);
+  if (job_id) { downloadArgs.push('--log', '--job', job_id); }
+  else         { downloadArgs.push('--log-failed'); }
+  if (repo)    downloadArgs.push('--repo', repo);
+
+  if (!isSafeGhCommand(['gh', ...downloadArgs]))
+    return { isError: true, content: [{ type: 'text', text: 'Internal error: unsafe gh download command blocked' }] };
+
+  const ghCmd = `gh ${downloadArgs.join(' ')} > ${tmpFile}`;
 
   return {
     content: [{
