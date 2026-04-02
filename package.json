@@ -11,8 +11,7 @@
   "scripts": {
     "build": "tsc && node add-shebang.mjs",
     "dev": "tsc --watch",
-    "test:safe": "node test-safe.mjs",
-    "prepare": "npm run build && node -e \"try{const fs=require('fs');fs.copyFileSync('hooks/pre-commit','.git/hooks/pre-commit');fs.chmodSync('.git/hooks/pre-commit','755')}catch{}\"",
+"prepare": "npm run build && node -e \"try{const fs=require('fs');fs.copyFileSync('hooks/pre-commit','.git/hooks/pre-commit');fs.chmodSync('.git/hooks/pre-commit','755')}catch{}\"",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
