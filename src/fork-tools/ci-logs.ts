@@ -1,19 +1,20 @@
-import type { ForkContext, ChatMessage, ToolResult } from './types.js';
-import { isSafeGhCommand } from './gh-safe.js';
+import os from 'os';
+import path from 'path';
+import type { ForkContext, ToolResult } from './types.js';
 
 export const CI_LOGS_TOOL = {
   name: 'ci_logs',
   description:
-    'Fetch GitHub Actions logs and diagnose failures using the local LLM — without raw logs entering Claude\'s context window.\n\n' +
+    'Diagnose GitHub Actions CI failures using the local LLM — raw logs never enter Claude\'s context.\n\n' +
     'Requires the `gh` CLI to be authenticated.\n\n' +
-    'WHEN TO USE:\n' +
-    '\u2022 Use INSTEAD of `gh run view --log` or `gh run view --log-failed` — raw logs will flood Claude\'s context\n' +
-    '\u2022 A CI run or job has failed and you want to know why\n' +
-    '\u2022 Build/test output is too large to paste directly\n\n' +
+    'TWO-STEP WORKFLOW:\n' +
+    '1. Call ci_logs (with optional run_id/job_id/workflow/branch) — returns a Bash download command\n' +
+    '2. Run that Bash command to download logs to /tmp\n' +
+    '3. Call ci_logs(log_file="/tmp/ci_<id>.txt") — returns LLM diagnosis\n\n' +
     'TIPS:\n' +
-    '\u2022 Omit run_id/job_id to auto-find the latest failed run (optionally filter by workflow/branch)\n' +
-    '\u2022 Use runs: 2-3 to detect flaky failures vs. consistently broken\n' +
-    '\u2022 Override filter to match language-specific patterns (e.g. "panic:|FAIL " for Go)',
+    '\u2022 Omit run_id/job_id to auto-find the latest failed run\n' +
+    '\u2022 Override filter to match language-specific patterns (e.g. "panic:|FAIL " for Go)\n' +
+    '\u2022 Use debug: true to inspect what the LLM received',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -23,23 +24,25 @@ export const CI_LOGS_TOOL = {
       },
       run_id: {
         type: 'string',
-        description: 'GitHub Actions run ID. Use for all failed steps of a specific run.',
+        description: 'GitHub Actions run ID. Skips auto-resolution when provided.',
       },
       job_id: {
         type: 'string',
-        description: 'GitHub Actions job ID. Returns full logs for that job only.',
+        description: 'GitHub Actions job ID. Fetches full logs for that job only.',
       },
       workflow: {
         type: 'string',
-        description: 'Workflow file name (e.g. "ci.yml"). Auto-finds the latest failed run when run_id is omitted.',
+        description: 'Workflow file name (e.g. "ci.yml"). Filters auto-resolution when run_id is omitted.',
       },
       branch: {
         type: 'string',
-        description: 'Branch to filter by when auto-resolving runs. Only used when run_id is omitted.',
+        description: 'Branch to filter by when auto-resolving runs.',
       },
-      runs: {
-        type: 'number',
-        description: 'Number of recent failed runs to analyze (1–3). Default 1. Use 2–3 to detect flaky vs. consistently broken.',
+      log_file: {
+        type: 'string',
+        description:
+          'Path to a log file under /tmp previously downloaded via Bash. ' +
+          'The file is read, analyzed, and deleted by this tool.',
       },
       filter: {
         type: 'string',
@@ -51,7 +54,7 @@ export const CI_LOGS_TOOL = {
       },
       debug: {
         type: 'boolean',
-        description: 'When true, append the filtered log sent to the LLM after the analysis. Useful for verifying the LLM is not hallucinating.',
+        description: 'When true, append the filtered log sent to the LLM after the analysis.',
       },
     },
     required: [],
@@ -276,84 +279,17 @@ function splitIntoSections(log: string): LogSection[] {
 }
 
 /**
- * Call the GitHub Jobs API to find which steps within a job concluded with 'failure'.
- * Returns null (non-fatal) if the API call fails or no failed steps are found.
+ * Validate that a log_file path is safe to read: must be absolute and under the system
+ * temp directory (or /tmp as a fallback) to prevent arbitrary file reads.
  */
-async function fetchFailedStepNames(
-  jobId: string,
-  repo: string | undefined,
-  ctx: ForkContext,
-): Promise<Set<string> | null> {
-  const repoPath = repo ?? ':owner/:repo';
-  try {
-    const { stdout } = await ctx.execFileAsync(
-      'gh',
-      ['api', `repos/${repoPath}/actions/jobs/${jobId}`],
-      { timeout: 15_000, maxBuffer: 512 * 1024 },
-    );
-    const data = JSON.parse(stdout) as { steps?: Array<{ name: string; conclusion: string }> };
-    const failed = (data.steps ?? []).filter((s) => s.conclusion === 'failure').map((s) => s.name);
-    return failed.length > 0 ? new Set(failed) : null;
-  } catch {
-    return null;
+function validateLogFilePath(filePath: string): string | null {
+  if (!path.isAbsolute(filePath)) return 'log_file must be an absolute path';
+  const tmpDir = os.tmpdir();
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(tmpDir + path.sep) && !resolved.startsWith('/tmp/')) {
+    return `log_file must be under ${tmpDir} or /tmp`;
   }
-}
-
-/**
- * Ask the local LLM to suggest alternative gh commands when the primary fetch fails.
- * Returns validated, safe command argument arrays or null if parsing/validation fails.
- */
-async function planFallbackCommands(
-  failedArgs: string[],
-  errorMsg: string,
-  context: { runId?: string; jobId?: string; repo?: string },
-  ctx: ForkContext,
-  route: { modelId: string },
-): Promise<string[][] | null> {
-  const ctxLines = [
-    context.repo && `Repository: ${context.repo}`,
-    context.runId && `Run ID: ${context.runId}`,
-    context.jobId && `Job ID: ${context.jobId}`,
-  ].filter(Boolean).join('\n');
-
-  const messages: ChatMessage[] = [
-    {
-      role: 'system',
-      content: 'You are a GitHub Actions CLI expert. Return ONLY valid JSON — no prose, no markdown fences.',
-    },
-    {
-      role: 'user',
-      content: [
-        'The following gh command failed:',
-        `  gh ${failedArgs.join(' ')}`,
-        `Error: ${errorMsg}`,
-        '',
-        ctxLines,
-        '',
-        'Suggest up to 4 alternative gh CLI commands to fetch the CI failure logs.',
-        'Rules: only use `gh` (no shell pipes, no grep, no other tools).',
-        'Return ONLY a JSON array of string arrays, e.g.:',
-        '[["gh","run","view","<run_id>","--json","jobs"],["gh","run","view","--job","<job_id>","--log"]]',
-      ].filter(Boolean).join('\n'),
-    },
-  ];
-
-  try {
-    const resp = await ctx.chatCompletionStreaming(messages, {
-      temperature: 0,
-      maxTokens: 400,
-      model: route.modelId,
-    });
-    const text = resp.content.replace(/```(?:json)?\n?|\n?```/g, '').trim();
-    const parsed: unknown = JSON.parse(text);
-    if (!Array.isArray(parsed)) return null;
-    const valid = (parsed as unknown[])
-      .filter((cmd) => Array.isArray(cmd) && isSafeGhCommand(cmd as unknown[]))
-      .slice(0, 4) as string[][];
-    return valid.length > 0 ? valid : null;
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 export async function handleCiLogs(
@@ -361,31 +297,21 @@ export async function handleCiLogs(
   ctx: ForkContext,
   progressToken?: string | number,
 ): Promise<ToolResult> {
-  const {
-    repo,
-    run_id,
-    job_id,
-    workflow,
-    branch,
-    runs: wantedRuns = 1,
-    filter,
-    context_lines,
-    debug = false,
-  } = args as {
+  const { repo, run_id, job_id, workflow, branch, filter, context_lines, debug = false, log_file } = args as {
     repo?: string;
     run_id?: string;
     job_id?: string;
     workflow?: string;
     branch?: string;
-    runs?: number;
     filter?: string;
     context_lines?: number;
     debug?: boolean;
+    log_file?: string;
   };
 
   const repoArgs = repo ? ['--repo', repo] : [];
 
-  // Compile filter regex
+  // Compile filter regex (needed for analyze mode)
   const pattern = filter ?? DEFAULT_FILTER;
   let filterRe: RegExp;
   try {
@@ -393,25 +319,84 @@ export async function handleCiLogs(
   } catch {
     return { isError: true, content: [{ type: 'text', text: `Invalid filter regex: ${pattern}` }] };
   }
-
   const ctxLines = context_lines ?? 3;
-  const runCount = Math.min(Math.max(1, wantedRuns), 3);
 
-  // Resolve which runs to analyze
-  type RunTarget = { id: string; title: string; runBranch: string };
-  let resolvedRuns: RunTarget[];
+  // ── Analyze mode ────────────────────────────────────────────────────────────
+  if (log_file) {
+    const pathErr = validateLogFilePath(log_file);
+    if (pathErr) return { isError: true, content: [{ type: 'text', text: pathErr }] };
 
-  if (job_id) {
-    resolvedRuns = [];  // job_id path bypasses run resolution
-  } else if (run_id) {
-    resolvedRuns = [{ id: run_id, title: run_id, runBranch: branch ?? '' }];
-  } else {
-    // Auto-resolve: find the N most recent failed runs via gh run list
+    let rawLog: string;
+    try {
+      rawLog = await ctx.readFile(log_file, 'utf8');
+    } catch (err) {
+      return { isError: true, content: [{ type: 'text', text: `Could not read log_file: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+    try { await ctx.writeFile(log_file, '', 'utf8'); } catch { /* best-effort delete */ }
+
+    const route = await ctx.routeToModel('analysis');
+    const cleanLog = rawLog
+      .replace(/\x1b\[[0-9;]*m/g, '')
+      .replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s/gm, '');
+    const logSections = splitIntoSections(cleanLog);
+
+    let assembled: string;
+    let totalSteps: number;
+    if (logSections.length > 0) {
+      const perSectionBudget = Math.max(10_000, Math.floor(MAX_LOG_BUDGET / logSections.length));
+      totalSteps = logSections.length;
+      assembled = logSections
+        .map((s) => `##[group]${s.name}\n${applyCharBudget(s.content, perSectionBudget)}`)
+        .join('\n\n');
+    } else {
+      totalSteps = 1;
+      const groupFiltered = filterByGroup(cleanLog, filterRe);
+      let { filtered, matchCount } = filterLines(groupFiltered, filterRe, ctxLines);
+      if (matchCount > ESCALATION_THRESHOLD && !filter) {
+        const errorsOnlyRe = new RegExp(ERRORS_ONLY_FILTER, 'i');
+        const { filtered: escalated, matchCount: escalatedCount } = filterLines(groupFiltered, errorsOnlyRe, ctxLines);
+        if (escalatedCount < matchCount) filtered = escalated;
+      }
+      const testSummary = extractTestSummary(cleanLog);
+      if (testSummary && !filtered.includes(testSummary.slice(0, 60))) {
+        filtered += '\n\n--- test summary ---\n' + testSummary;
+      }
+      assembled = applyCharBudget(capLines(deduplicateLines(filtered), LINE_CAP), MAX_LOG_BUDGET);
+    }
+
+    const systemContent = [
+      'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why, referencing the step name from ##[group] headers where visible\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.\nOnly reference information explicitly present in the log excerpt. If the root cause is not visible in the excerpt, say so — do not invent error messages, file paths, or fixes.',
+      route.hints.outputConstraint ?? '',
+    ].filter(Boolean).join('\n');
+    const messages = [
+      { role: 'system' as const, content: systemContent },
+      { role: 'user' as const, content: `Log sections (${totalSteps} step${totalSteps !== 1 ? 's' : ''}):\n\`\`\`\n${assembled}\n\`\`\`` },
+    ];
+    try {
+      const resp = await ctx.chatCompletionStreaming(messages, {
+        temperature: route.hints.chatTemp,
+        maxTokens: Math.min(ctx.adaptiveMaxTokens(assembled.length, route.contextLength), CI_ANALYSIS_MAX_TOKENS),
+        model: route.modelId,
+        progressToken,
+      });
+      const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from log file)` + ctx.formatFooter(resp);
+      const debugSection = debug ? `\n\n---\n**Debug — filtered log sent to LLM (${assembled.length} chars):**\n\`\`\`\n${assembled}\n\`\`\`` : '';
+      return { content: [{ type: 'text', text: resp.content + footer + debugSection }] };
+    } catch (err) {
+      return { isError: true, content: [{ type: 'text', text: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+  }
+
+  // ── Resolve mode ─────────────────────────────────────────────────────────────
+  // Find the run ID if not provided, then return a Bash download instruction.
+  // The log download goes through Claude's Bash tool (user approval), not houtini.
+  let runId = run_id;
+  if (!runId && !job_id) {
     const listArgs = [
       'run', 'list',
       '--json', 'databaseId,displayTitle,headBranch',
       '--status', 'failure',
-      '--limit', String(runCount * 3),
+      '--limit', '1',
       ...repoArgs,
     ];
     if (workflow) listArgs.push('--workflow', workflow);
@@ -421,173 +406,30 @@ export async function handleCiLogs(
     try {
       ({ stdout: listStdout } = await ctx.execFileAsync('gh', listArgs, { timeout: 20_000, maxBuffer: 1024 * 1024 }));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { isError: true, content: [{ type: 'text', text: `gh run list failed: ${msg}` }] };
+      return { isError: true, content: [{ type: 'text', text: `gh run list failed: ${err instanceof Error ? err.message : String(err)}` }] };
     }
 
-    let failedRuns: Array<{ databaseId: number; displayTitle: string; headBranch: string }>;
-    try {
-      failedRuns = JSON.parse(listStdout);
-    } catch {
+    let runs: Array<{ databaseId: number; displayTitle: string; headBranch: string }>;
+    try { runs = JSON.parse(listStdout); } catch {
       return { isError: true, content: [{ type: 'text', text: 'Failed to parse gh run list output.' }] };
     }
-
-    const selected = failedRuns.slice(0, runCount);
-    if (selected.length === 0) {
+    if (runs.length === 0) {
       const what = [workflow && `workflow "${workflow}"`, branch && `branch "${branch}"`].filter(Boolean).join(', ');
       return { content: [{ type: 'text', text: `No failed runs found${what ? ` for ${what}` : ''}.` }] };
     }
-    resolvedRuns = selected.map((r) => ({ id: String(r.databaseId), title: r.displayTitle, runBranch: r.headBranch }));
+    runId = String(runs[0].databaseId);
   }
 
-  // Determine gh invocations
-  type GhTarget = { ghArgs: string[]; label: string; runId?: string };
-  const targets: GhTarget[] = job_id
-    ? [{
-        ghArgs: run_id
-          ? ['run', 'view', run_id, '--log', ...repoArgs, '--job', job_id]
-          : ['run', 'view', '--log', ...repoArgs, '--job', job_id],
-        label: `job ${job_id}`,
-        runId: run_id,
-      }]
-    : resolvedRuns.map((r) => ({
-        ghArgs: ['run', 'view', r.id, '--log-failed', ...repoArgs],
-        label: resolvedRuns.length > 1 ? `run ${r.id} — ${r.title} (${r.runBranch})` : `run ${r.id}`,
-        runId: r.id,
-      }));
+  const tmpFile = `/tmp/ci_${runId ?? job_id}.txt`;
+  const repoFlag = repo ? ` --repo ${repo}` : '';
+  const ghCmd = job_id
+    ? `gh run view${runId ? ` ${runId}` : ''} --log --job ${job_id}${repoFlag} > ${tmpFile}`
+    : `gh run view ${runId} --log-failed${repoFlag} > ${tmpFile}`;
 
-  const route = await ctx.routeToModel('analysis');
-
-  // When a specific job is targeted, fetch per-step conclusions from the Jobs API so we can
-  // slice the log to only the steps that actually failed. Non-fatal if the API call fails.
-  const failedStepNames = job_id ? await fetchFailedStepNames(job_id, repo, ctx) : null;
-
-  const sections: string[] = [];
-  let totalSteps = 0;
-
-  for (const { ghArgs, label, runId: targetRunId } of targets) {
-    let rawLog: string | null = null;
-    let fetchError: string | null = null;
-
-    try {
-      ({ stdout: rawLog } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 }));
-    } catch (err) {
-      fetchError = err instanceof Error ? err.message : String(err);
-    }
-
-    // Primary fetch failed — ask local LLM for alternative commands
-    if (rawLog === null && fetchError !== null) {
-      const fallbackCmds = await planFallbackCommands(
-        ghArgs, fetchError, { runId: targetRunId, jobId: job_id, repo }, ctx, route,
-      );
-      if (fallbackCmds) {
-        const parts: string[] = [];
-        for (const fbArgs of fallbackCmds) {
-          try {
-            const { stdout } = await ctx.execFileAsync(fbArgs[0], fbArgs.slice(1), {
-              timeout: 30_000, maxBuffer: 10 * 1024 * 1024,
-            });
-            if (stdout.trim()) parts.push(stdout);
-          } catch { /* skip failed fallback commands */ }
-        }
-        if (parts.length > 0) rawLog = parts.join('\n\n');
-      }
-    }
-
-    if (rawLog === null) {
-      sections.push(targets.length > 1 ? `## ${label}\n(fetch failed: ${fetchError!})` : `fetch failed: ${fetchError!}`);
-      continue;
-    }
-
-    if (!rawLog.trim()) {
-      sections.push(targets.length > 1
-        ? `## ${label}\n(no output — run may have succeeded or logs may have expired)`
-        : 'No failed-step logs found — the run may have succeeded or logs may have expired.');
-      continue;
-    }
-
-    const cleanLog = rawLog
-      .replace(/\x1b\[[0-9;]*m/g, '')                    // strip ANSI colour codes
-      .replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s/gm, '');  // strip leading ISO timestamps
-
-    const logSections = splitIntoSections(cleanLog);
-
-    let assembled: string;
-    if (logSections.length > 0) {
-      // Structural path: keep only the steps that failed (or all steps when step info is unavailable)
-      const relevant = failedStepNames
-        ? logSections.filter((s) => failedStepNames.has(s.name))
-        : logSections;
-      const usedSections = relevant.length > 0 ? relevant : logSections;
-      const perSectionBudget = Math.max(10_000, Math.floor(MAX_LOG_BUDGET / usedSections.length));
-      totalSteps += usedSections.length;
-      assembled = usedSections
-        .map((s) => `##[group]${s.name}\n${applyCharBudget(s.content, perSectionBudget)}`)
-        .join('\n\n');
-    } else {
-      // Fallback: no ##[group] markers — use the legacy regex-filter pipeline
-      totalSteps += 1;
-      const groupFiltered = filterByGroup(cleanLog, filterRe);
-      let { filtered, matchCount } = filterLines(groupFiltered, filterRe, ctxLines);
-      if (matchCount > ESCALATION_THRESHOLD && !filter) {
-        const errorsOnlyRe = new RegExp(ERRORS_ONLY_FILTER, 'i');
-        const { filtered: escalated, matchCount: escalatedCount } = filterLines(groupFiltered, errorsOnlyRe, ctxLines);
-        if (escalatedCount < matchCount) filtered = escalated;
-      }
-      // Append the test-framework summary block if present and not already covered
-      const testSummary = extractTestSummary(cleanLog);
-      if (testSummary && !filtered.includes(testSummary.slice(0, 60))) {
-        filtered += '\n\n--- test summary ---\n' + testSummary;
-      }
-      assembled = applyCharBudget(capLines(deduplicateLines(filtered), LINE_CAP), MAX_LOG_BUDGET);
-    }
-
-    sections.push(targets.length > 1 ? `## ${label}\n${assembled}` : assembled);
-  }
-
-  if (sections.length === 0) {
-    return { content: [{ type: 'text', text: 'No logs could be fetched.' }] };
-  }
-
-  const combinedLog = sections.join('\n\n---\n\n');
-  const isMultiRun = resolvedRuns.length > 1;
-
-  const systemContent = [
-    isMultiRun
-      ? 'You are a CI failure analyst reviewing multiple runs. First identify: are failures consistent across all runs (systemic) or only in some (flaky)? Then provide root cause and fix.'
-      : 'You are a CI failure analyst. Diagnose the build/test failure from the log excerpt and provide:\n1. Root cause — what failed and why, referencing the step name from ##[group] headers where visible\n2. Fix — the specific change needed\n3. If relevant: what to verify after applying the fix\nBe concise. Reference step names and line numbers where visible.\nOnly reference information explicitly present in the log excerpt. If the root cause is not visible in the excerpt, say so — do not invent error messages, file paths, or fixes.',
-    route.hints.outputConstraint ?? '',
-  ].filter(Boolean).join('\n');
-
-  const repoLine = repo ? `Repository: ${repo}\n` : '';
-  const targetLabel = job_id ? `job ${job_id}` : resolvedRuns.map((r) => r.id).join(', ');
-  const messages: ChatMessage[] = [
-    { role: 'system', content: systemContent },
-    {
-      role: 'user',
-      content: `${repoLine}Target: ${targetLabel}\n\nLog sections (${totalSteps} step${totalSteps !== 1 ? 's' : ''}):\n\`\`\`\n${combinedLog}\n\`\`\``,
-    },
-  ];
-
-  try {
-    const resp = await ctx.chatCompletionStreaming(messages, {
-      temperature: route.hints.chatTemp,
-      maxTokens: Math.min(ctx.adaptiveMaxTokens(combinedLog.length, route.contextLength), CI_ANALYSIS_MAX_TOKENS),
-      model: route.modelId,
-      progressToken,
-    });
-    const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
-      ctx.formatFooter(resp);
-    const debugSection = debug
-      ? `\n\n---\n**Debug — filtered log sent to LLM (${combinedLog.length} chars):**\n\`\`\`\n${combinedLog}\n\`\`\``
-      : '';
-    return {
-      content: [{
-        type: 'text',
-        text: resp.content + footer + debugSection,
-      }],
-    };
-  } catch (err) {
-    return { isError: true, content: [{ type: 'text', text: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` }] };
-  }
+  return {
+    content: [{
+      type: 'text',
+      text: `Download the logs first (keeps raw output out of Claude's context):\n\nBash: \`${ghCmd}\`\n\nThen: \`ci_logs(log_file="${tmpFile}")\``,
+    }],
+  };
 }
