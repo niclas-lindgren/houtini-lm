@@ -360,6 +360,8 @@ export async function handleCiLogs(
       assembled = logSections
         .map((s) => `##[group]${s.name}\n${applyCharBudget(s.content, perSectionBudget)}`)
         .join('\n\n');
+      // Per-section budget floors at 10K so many sections can exceed MAX_LOG_BUDGET total — cap it.
+      assembled = applyCharBudget(assembled, MAX_LOG_BUDGET);
     } else {
       totalSteps = 1;
       const groupFiltered = filterByGroup(cleanLog, filterRe);
@@ -392,7 +394,10 @@ export async function handleCiLogs(
         progressToken,
       });
       const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from log file)` + ctx.formatFooter(resp);
-      const debugSection = debug ? `\n\n---\n**Debug — filtered log sent to LLM (${assembled.length} chars):**\n\`\`\`\n${assembled}\n\`\`\`` : '';
+      const DEBUG_PREVIEW = 8_000;
+      const debugSection = debug
+        ? `\n\n---\n**Debug — filtered log sent to LLM (${assembled.length} chars${assembled.length > DEBUG_PREVIEW ? `, showing first ${DEBUG_PREVIEW}` : ''}):**\n\`\`\`\n${assembled.slice(0, DEBUG_PREVIEW)}${assembled.length > DEBUG_PREVIEW ? '\n...(truncated in debug view)' : ''}\n\`\`\``
+        : '';
       return { content: [{ type: 'text', text: resp.content + footer + debugSection }] };
     } catch (err) {
       return { isError: true, content: [{ type: 'text', text: `LLM call failed: ${err instanceof Error ? err.message : String(err)}` }] };
