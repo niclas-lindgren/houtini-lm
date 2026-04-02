@@ -57,11 +57,64 @@ export const CI_LOGS_TOOL = {
   },
 };
 
-const DEFAULT_FILTER = '##\\[error\\]|##\\[warning\\]|Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
-const ERRORS_ONLY_FILTER = '##\\[error\\]|Error:|error:|FAILED|failed|FAIL |Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file';
+const DEFAULT_FILTER =
+  '##\\[error\\]|##\\[warning\\]' +
+  // Generic
+  '|Error:|error:|FAILED|failed|FAIL[\\t ]|Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file' +
+  // Rust / Cargo
+  '|error\\[E\\d+\\]|could not compile' +
+  // Java / Maven / Gradle
+  '|BUILD FAILURE|COMPILATION ERROR|Failed to execute goal' +
+  // C# / MSBuild / dotnet
+  '|error CS\\d+|MSB\\d+' +
+  // Python
+  '|ModuleNotFoundError|ImportError|FAILED tests/' +
+  // PHP
+  '|PHP (?:Parse|Fatal) error' +
+  // Ruby / Bundler
+  '|Bundler::GemNotFound|could not load such file';
+const ERRORS_ONLY_FILTER =
+  '##\\[error\\]' +
+  // Generic
+  '|Error:|error:|FAILED|failed|FAIL[\\t ]|Exception|assert|panic:|fatal:|TypeError|SyntaxError|Cannot find|No such file' +
+  // Rust / Cargo
+  '|error\\[E\\d+\\]|could not compile' +
+  // Java / Maven / Gradle
+  '|BUILD FAILURE|COMPILATION ERROR|Failed to execute goal' +
+  // C# / MSBuild / dotnet
+  '|error CS\\d+|MSB\\d+' +
+  // Python
+  '|ModuleNotFoundError|ImportError|FAILED tests/' +
+  // PHP
+  '|PHP (?:Parse|Fatal) error' +
+  // Ruby / Bundler
+  '|Bundler::GemNotFound|could not load such file';
 const ESCALATION_THRESHOLD = 150; // lines — when exceeded with default filter, drop ##[warning] and re-filter
-const LINE_CAP = 250;             // max lines sent to LLM — head+tail split when exceeded
+const LINE_CAP = 250;             // max lines for the regex-fallback path
 const CI_ANALYSIS_MAX_TOKENS = 600;
+const MAX_LOG_BUDGET = 150_000;   // total chars across all sections sent to the analysis LLM
+
+const TEST_SUMMARY_MARKERS = [
+  /={3,} (?:short test summary info|FAILURES|ERRORS) ={3,}/i, // pytest
+  /^Tests run: \d+, Failures: [1-9]/m,                         // Maven Surefire failure summary
+  /^> Task :.+ FAILED$/m,                                       // Gradle task failure
+];
+const TEST_SUMMARY_MAX_LINES = 200;
+
+/**
+ * Find the highest-signal test failure summary block — the tail of the log starting from a
+ * well-known test-framework summary header. Returns null if none is found.
+ */
+function extractTestSummary(log: string): string | null {
+  let earliest = -1;
+  for (const marker of TEST_SUMMARY_MARKERS) {
+    const m = marker.exec(log);
+    if (m && (earliest === -1 || m.index < earliest)) earliest = m.index;
+  }
+  if (earliest === -1) return null;
+  const tail = log.slice(earliest).split('\n').slice(0, TEST_SUMMARY_MAX_LINES).join('\n');
+  return tail;
+}
 
 function filterLines(raw: string, re: RegExp, ctxLines: number): { filtered: string; matchCount: number } {
   const allLines = raw.split('\n');
@@ -125,11 +178,11 @@ function filterByGroup(raw: string, re: RegExp): string {
   return out.join('\n');
 }
 
-// Preserve head (job/step context) + tail (failure output) when log exceeds budget.
-// 10% head keeps the step header that identifies which job failed; 90% tail captures error messages.
+// 5% head preserves the step/group header line; 95% tail captures the failure output.
+// Test results and error output almost always appear at the END of a CI step, after build/compile noise.
 function applyCharBudget(log: string, budget: number): string {
   if (log.length <= budget) return log;
-  const headBudget = Math.floor(budget * 0.10);
+  const headBudget = Math.floor(budget * 0.05);
   const tailBudget = budget - headBudget;
   const omitted = log.length - budget;
   return log.slice(0, headBudget) + `\n\n...(${omitted} chars omitted)...\n\n` + log.slice(-tailBudget);
@@ -179,6 +232,70 @@ function deduplicateLines(log: string): string {
       return count > 1 ? `${first}  (×${count})` : first;
     })
     .join('\n');
+}
+
+type LogSection = { name: string; content: string };
+
+/**
+ * Split a GitHub Actions log into per-step sections using ##[group]/##[endgroup] markers.
+ * Returns an empty array if the log contains no group markers.
+ */
+function splitIntoSections(log: string): LogSection[] {
+  if (!log.includes('##[group]')) return [];
+
+  const lines = log.split('\n');
+  const sections: LogSection[] = [];
+  let name = '';
+  let buf: string[] = [];
+  let inGroup = false;
+
+  for (const line of lines) {
+    const m = line.match(/##\[group\](.*)/);
+    if (m) {
+      if (inGroup && buf.length > 0) sections.push({ name, content: buf.join('\n') });
+      name = m[1].trim();
+      buf = [line];
+      inGroup = true;
+    } else if (line.includes('##[endgroup]')) {
+      if (inGroup) {
+        buf.push(line);
+        sections.push({ name, content: buf.join('\n') });
+        name = '';
+        buf = [];
+        inGroup = false;
+      }
+    } else if (inGroup) {
+      buf.push(line);
+    }
+  }
+  // Handle unterminated last section (truncated logs)
+  if (inGroup && buf.length > 0) sections.push({ name, content: buf.join('\n') });
+
+  return sections;
+}
+
+/**
+ * Call the GitHub Jobs API to find which steps within a job concluded with 'failure'.
+ * Returns null (non-fatal) if the API call fails or no failed steps are found.
+ */
+async function fetchFailedStepNames(
+  jobId: string,
+  repo: string | undefined,
+  ctx: ForkContext,
+): Promise<Set<string> | null> {
+  const repoPath = repo ?? ':owner/:repo';
+  try {
+    const { stdout } = await ctx.execFileAsync(
+      'gh',
+      ['api', `repos/${repoPath}/actions/jobs/${jobId}`],
+      { timeout: 15_000, maxBuffer: 512 * 1024 },
+    );
+    const data = JSON.parse(stdout) as { steps?: Array<{ name: string; conclusion: string }> };
+    const failed = (data.steps ?? []).filter((s) => s.conclusion === 'failure').map((s) => s.name);
+    return failed.length > 0 ? new Set(failed) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function handleCiLogs(
@@ -280,11 +397,13 @@ export async function handleCiLogs(
       }));
 
   const route = await ctx.routeToModel('analysis');
-  const totalCharBudget = Math.min(Math.max(10_000, (route.contextLength - 812) * 2), 50_000);
-  const perRunBudget = Math.floor(totalCharBudget / targets.length);
+
+  // When a specific job is targeted, fetch per-step conclusions from the Jobs API so we can
+  // slice the log to only the steps that actually failed. Non-fatal if the API call fails.
+  const failedStepNames = job_id ? await fetchFailedStepNames(job_id, repo, ctx) : null;
 
   const sections: string[] = [];
-  let totalMatchCount = 0;
+  let totalSteps = 0;
 
   for (const { ghArgs, label } of targets) {
     let rawLog: string;
@@ -303,21 +422,43 @@ export async function handleCiLogs(
       continue;
     }
 
-    const cleanLog = rawLog.replace(/\x1b\[[0-9;]*m/g, '');
-    const groupFiltered = filterByGroup(cleanLog, filterRe);
-    let { filtered, matchCount } = filterLines(groupFiltered, filterRe, ctxLines);
-    // Auto-escalate: when warning spam dominates, re-filter with errors-only and take the smaller result
-    if (matchCount > ESCALATION_THRESHOLD && !filter) {
-      const errorsOnlyRe = new RegExp(ERRORS_ONLY_FILTER, 'i');
-      const { filtered: escalated, matchCount: escalatedCount } = filterLines(groupFiltered, errorsOnlyRe, ctxLines);
-      if (escalatedCount < matchCount) {
-        filtered = escalated;
-        matchCount = escalatedCount;
+    const cleanLog = rawLog
+      .replace(/\x1b\[[0-9;]*m/g, '')                    // strip ANSI colour codes
+      .replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s/gm, '');  // strip leading ISO timestamps
+
+    const logSections = splitIntoSections(cleanLog);
+
+    let assembled: string;
+    if (logSections.length > 0) {
+      // Structural path: keep only the steps that failed (or all steps when step info is unavailable)
+      const relevant = failedStepNames
+        ? logSections.filter((s) => failedStepNames.has(s.name))
+        : logSections;
+      const usedSections = relevant.length > 0 ? relevant : logSections;
+      const perSectionBudget = Math.max(10_000, Math.floor(MAX_LOG_BUDGET / usedSections.length));
+      totalSteps += usedSections.length;
+      assembled = usedSections
+        .map((s) => `##[group]${s.name}\n${applyCharBudget(s.content, perSectionBudget)}`)
+        .join('\n\n');
+    } else {
+      // Fallback: no ##[group] markers — use the legacy regex-filter pipeline
+      totalSteps += 1;
+      const groupFiltered = filterByGroup(cleanLog, filterRe);
+      let { filtered, matchCount } = filterLines(groupFiltered, filterRe, ctxLines);
+      if (matchCount > ESCALATION_THRESHOLD && !filter) {
+        const errorsOnlyRe = new RegExp(ERRORS_ONLY_FILTER, 'i');
+        const { filtered: escalated, matchCount: escalatedCount } = filterLines(groupFiltered, errorsOnlyRe, ctxLines);
+        if (escalatedCount < matchCount) filtered = escalated;
       }
+      // Append the test-framework summary block if present and not already covered
+      const testSummary = extractTestSummary(cleanLog);
+      if (testSummary && !filtered.includes(testSummary.slice(0, 60))) {
+        filtered += '\n\n--- test summary ---\n' + testSummary;
+      }
+      assembled = applyCharBudget(capLines(deduplicateLines(filtered), LINE_CAP), MAX_LOG_BUDGET);
     }
-    totalMatchCount += matchCount;
-    const budgeted = applyCharBudget(capLines(deduplicateLines(filtered), LINE_CAP), perRunBudget);
-    sections.push(targets.length > 1 ? `## ${label}\n${budgeted}` : budgeted);
+
+    sections.push(targets.length > 1 ? `## ${label}\n${assembled}` : assembled);
   }
 
   if (sections.length === 0) {
@@ -340,7 +481,7 @@ export async function handleCiLogs(
     { role: 'system', content: systemContent },
     {
       role: 'user',
-      content: `${repoLine}Target: ${targetLabel}\n\nFiltered log (${totalMatchCount} matching lines):\n\`\`\`\n${combinedLog}\n\`\`\``,
+      content: `${repoLine}Target: ${targetLabel}\n\nLog sections (${totalSteps} step${totalSteps !== 1 ? 's' : ''}):\n\`\`\`\n${combinedLog}\n\`\`\``,
     },
   ];
 
@@ -351,7 +492,7 @@ export async function handleCiLogs(
       model: route.modelId,
       progressToken,
     });
-    const footer = `\n\n(${totalMatchCount} matched lines from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
+    const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from ${job_id ? 'job' : isMultiRun ? `${resolvedRuns.length} runs` : 'run'} logs)` +
       ctx.formatFooter(resp);
     const debugSection = debug
       ? `\n\n---\n**Debug — filtered log sent to LLM (${combinedLog.length} chars):**\n\`\`\`\n${combinedLog}\n\`\`\``
