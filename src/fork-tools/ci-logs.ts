@@ -1,4 +1,3 @@
-import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import type { ForkContext, ToolResult } from './types.js';
@@ -15,7 +14,8 @@ export const CI_LOGS_TOOL = {
     'TWO-STEP WORKFLOW:\n' +
     '1. Call ci_logs (with optional run_id/job_id/workflow/branch) — returns a Bash download command\n' +
     '2. Run that Bash command to download logs to /tmp\n' +
-    '3. Call ci_logs(log_file="/tmp/ci_<id>.txt") — returns LLM diagnosis\n\n' +
+    '3. Call ci_logs(log_file="/tmp/ci_<id>.txt") — returns LLM diagnosis\n' +
+    'IMPORTANT: Always proceed to step 3 even if the Bash command exits non-zero. Do NOT run additional gh or shell commands to investigate — the local LLM will diagnose any download errors in the file.\n\n' +
     'TIPS:\n' +
     '\u2022 Omit run_id/job_id to auto-find the latest failed run\n' +
     '\u2022 Override filter to match language-specific patterns (e.g. "panic:|FAIL " for Go)\n' +
@@ -344,7 +344,7 @@ export async function handleCiLogs(
     } catch (err) {
       return { isError: true, content: [{ type: 'text', text: `Could not read log_file: ${err instanceof Error ? err.message : String(err)}` }] };
     }
-    try { await fs.unlink(log_file); } catch { /* best-effort delete */ }
+    // Log file stays in /tmp — OS will clean it up. Deleting here breaks debug re-runs.
 
     const route = await ctx.routeToModel('analysis');
     const cleanLog = rawLog
@@ -446,12 +446,12 @@ export async function handleCiLogs(
   if (!isSafeGhCommand(['gh', ...downloadArgs]))
     return { isError: true, content: [{ type: 'text', text: 'Internal error: unsafe gh download command blocked' }] };
 
-  const ghCmd = `gh ${downloadArgs.join(' ')} > ${tmpFile}`;
+  const ghCmd = `gh ${downloadArgs.join(' ')} > ${tmpFile} 2>&1`;
 
   return {
     content: [{
       type: 'text',
-      text: `Download the logs first (keeps raw output out of Claude's context):\n\nBash: \`${ghCmd}\`\n\nThen: \`ci_logs(log_file="${tmpFile}")\``,
+      text: `Download the logs first (keeps raw output out of Claude's context):\n\nBash: \`${ghCmd}\`\n\nThen call \`ci_logs(log_file="${tmpFile}")\` — do this even if the Bash command exits non-zero; the local LLM will diagnose errors in the output too. Do NOT run additional gh or shell commands to investigate.`,
     }],
   };
 }
