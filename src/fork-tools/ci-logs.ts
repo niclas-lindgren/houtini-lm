@@ -1,4 +1,5 @@
 import type { ForkContext, ChatMessage, ToolResult } from './types.js';
+import { isSafeGhCommand } from './gh-safe.js';
 
 export const CI_LOGS_TOOL = {
   name: 'ci_logs',
@@ -298,6 +299,63 @@ async function fetchFailedStepNames(
   }
 }
 
+/**
+ * Ask the local LLM to suggest alternative gh commands when the primary fetch fails.
+ * Returns validated, safe command argument arrays or null if parsing/validation fails.
+ */
+async function planFallbackCommands(
+  failedArgs: string[],
+  errorMsg: string,
+  context: { runId?: string; jobId?: string; repo?: string },
+  ctx: ForkContext,
+  route: { modelId: string },
+): Promise<string[][] | null> {
+  const ctxLines = [
+    context.repo && `Repository: ${context.repo}`,
+    context.runId && `Run ID: ${context.runId}`,
+    context.jobId && `Job ID: ${context.jobId}`,
+  ].filter(Boolean).join('\n');
+
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content: 'You are a GitHub Actions CLI expert. Return ONLY valid JSON — no prose, no markdown fences.',
+    },
+    {
+      role: 'user',
+      content: [
+        'The following gh command failed:',
+        `  gh ${failedArgs.join(' ')}`,
+        `Error: ${errorMsg}`,
+        '',
+        ctxLines,
+        '',
+        'Suggest up to 4 alternative gh CLI commands to fetch the CI failure logs.',
+        'Rules: only use `gh` (no shell pipes, no grep, no other tools).',
+        'Return ONLY a JSON array of string arrays, e.g.:',
+        '[["gh","run","view","<run_id>","--json","jobs"],["gh","run","view","--job","<job_id>","--log"]]',
+      ].filter(Boolean).join('\n'),
+    },
+  ];
+
+  try {
+    const resp = await ctx.chatCompletionStreaming(messages, {
+      temperature: 0,
+      maxTokens: 400,
+      model: route.modelId,
+    });
+    const text = resp.content.replace(/```(?:json)?\n?|\n?```/g, '').trim();
+    const parsed: unknown = JSON.parse(text);
+    if (!Array.isArray(parsed)) return null;
+    const valid = (parsed as unknown[])
+      .filter((cmd) => Array.isArray(cmd) && isSafeGhCommand(cmd as unknown[]))
+      .slice(0, 4) as string[][];
+    return valid.length > 0 ? valid : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function handleCiLogs(
   args: unknown,
   ctx: ForkContext,
@@ -383,17 +441,19 @@ export async function handleCiLogs(
   }
 
   // Determine gh invocations
-  type GhTarget = { ghArgs: string[]; label: string };
+  type GhTarget = { ghArgs: string[]; label: string; runId?: string };
   const targets: GhTarget[] = job_id
     ? [{
         ghArgs: run_id
           ? ['run', 'view', run_id, '--log', ...repoArgs, '--job', job_id]
           : ['run', 'view', '--log', ...repoArgs, '--job', job_id],
         label: `job ${job_id}`,
+        runId: run_id,
       }]
     : resolvedRuns.map((r) => ({
         ghArgs: ['run', 'view', r.id, '--log-failed', ...repoArgs],
         label: resolvedRuns.length > 1 ? `run ${r.id} — ${r.title} (${r.runBranch})` : `run ${r.id}`,
+        runId: r.id,
       }));
 
   const route = await ctx.routeToModel('analysis');
@@ -405,13 +465,37 @@ export async function handleCiLogs(
   const sections: string[] = [];
   let totalSteps = 0;
 
-  for (const { ghArgs, label } of targets) {
-    let rawLog: string;
+  for (const { ghArgs, label, runId: targetRunId } of targets) {
+    let rawLog: string | null = null;
+    let fetchError: string | null = null;
+
     try {
       ({ stdout: rawLog } = await ctx.execFileAsync('gh', ghArgs, { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 }));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      sections.push(targets.length > 1 ? `## ${label}\n(fetch failed: ${msg})` : `fetch failed: ${msg}`);
+      fetchError = err instanceof Error ? err.message : String(err);
+    }
+
+    // Primary fetch failed — ask local LLM for alternative commands
+    if (rawLog === null && fetchError !== null) {
+      const fallbackCmds = await planFallbackCommands(
+        ghArgs, fetchError, { runId: targetRunId, jobId: job_id, repo }, ctx, route,
+      );
+      if (fallbackCmds) {
+        const parts: string[] = [];
+        for (const fbArgs of fallbackCmds) {
+          try {
+            const { stdout } = await ctx.execFileAsync(fbArgs[0], fbArgs.slice(1), {
+              timeout: 30_000, maxBuffer: 10 * 1024 * 1024,
+            });
+            if (stdout.trim()) parts.push(stdout);
+          } catch { /* skip failed fallback commands */ }
+        }
+        if (parts.length > 0) rawLog = parts.join('\n\n');
+      }
+    }
+
+    if (rawLog === null) {
+      sections.push(targets.length > 1 ? `## ${label}\n(fetch failed: ${fetchError!})` : `fetch failed: ${fetchError!}`);
       continue;
     }
 
