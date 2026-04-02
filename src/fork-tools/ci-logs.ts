@@ -20,7 +20,8 @@ export const CI_LOGS_TOOL = {
     'TIPS:\n' +
     '\u2022 Omit run_id/job_id to auto-find the latest failed run\n' +
     '\u2022 Override filter to match language-specific patterns (e.g. "panic:|FAIL " for Go)\n' +
-    '\u2022 Use debug: true to inspect what the LLM received',
+    '\u2022 Use debug: true to inspect what the LLM received\n' +
+    '\u2022 If analysis is empty or unhelpful, retry with debug:true — do NOT run additional gh commands',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -108,7 +109,7 @@ const ERRORS_ONLY_FILTER =
   '|Bundler::GemNotFound|could not load such file';
 const ESCALATION_THRESHOLD = 150; // lines — when exceeded with default filter, drop ##[warning] and re-filter
 const LINE_CAP = 250;             // max lines for the regex-fallback path
-const CI_ANALYSIS_MAX_TOKENS = 600;
+const CI_ANALYSIS_MAX_TOKENS = 3000;
 const MAX_LOG_BUDGET = 150_000;   // total chars across all sections sent to the analysis LLM
 const SEMANTIC_RANKING_THRESHOLD = 8;   // only rank when section count exceeds this
 const SEMANTIC_TOP_K = 8;               // sections to keep after ranking
@@ -446,6 +447,12 @@ export async function handleCiLogs(
         model: route.modelId,
         progressToken,
       });
+      if (!resp.content.trim()) {
+        const hint = assembled.length < 300
+          ? 'The log file appears to contain only an error message — the download likely failed.'
+          : 'The LLM may have exhausted its token budget on reasoning without producing output. Retry with debug:true to inspect what was sent to the LLM.';
+        return { isError: true, content: [{ type: 'text', text: `CI analysis returned no content. ${hint}` }] };
+      }
       const footer = `\n\n(${totalSteps} step${totalSteps !== 1 ? 's' : ''} from log file)` + ctx.formatFooter(resp);
       const DEBUG_PREVIEW = 8_000;
       const debugSection = debug
