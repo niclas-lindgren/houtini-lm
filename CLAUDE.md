@@ -64,6 +64,12 @@ Tests require a live LLM endpoint. If hopper is available, run: `LM_STUDIO_URL=h
 5. `npm publish`
 6. Sync to hopper: `robocopy C:\mcp\houtini-lm \\hopper\d\MCP\houtini-lm /MIR /MT:4 /XD .git node_modules __pycache__ .next .venv /XF *.pyc /NFL /NP`
 
+## Commit messages
+
+Under ~50 lines changed: write the message directly. Larger diffs: use `mcp__houtini-lm__diff_review(diff: "<git diff output>", mode: "commit_message")` to generate it via the local LLM.
+
+Do **not** delegate this to a general-purpose subagent — subagents lack access to the houtini MCP and will summarize in-context instead of using the local model.
+
 ## Git
 
 - Branch: `main`
