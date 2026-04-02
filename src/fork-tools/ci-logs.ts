@@ -2,6 +2,7 @@ import os from 'os';
 import path from 'path';
 import type { ForkContext, ToolResult } from './types.js';
 import { isSafeGhCommand } from './gh-safe.js';
+import { embedText, cosineSimilarity } from './embed-utils.js';
 
 const SAFE_RUN_ID = /^\d+$/;
 const SAFE_REPO   = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
@@ -61,6 +62,13 @@ export const CI_LOGS_TOOL = {
         type: 'boolean',
         description: 'When true, append the filtered log sent to the LLM after the analysis.',
       },
+      task: {
+        type: 'string',
+        description:
+          'Describe what to look for (e.g. "TypeScript type error", "flaky integration test"). ' +
+          'Used to semantically rank and filter CI log sections when there are many steps. ' +
+          'Defaults to general failure signals when omitted.',
+      },
     },
     required: [],
   },
@@ -102,6 +110,10 @@ const ESCALATION_THRESHOLD = 150; // lines — when exceeded with default filter
 const LINE_CAP = 250;             // max lines for the regex-fallback path
 const CI_ANALYSIS_MAX_TOKENS = 600;
 const MAX_LOG_BUDGET = 150_000;   // total chars across all sections sent to the analysis LLM
+const SEMANTIC_RANKING_THRESHOLD = 8;   // only rank when section count exceeds this
+const SEMANTIC_TOP_K = 8;               // sections to keep after ranking
+const SEMANTIC_SECTION_SNIPPET = 500;   // chars of section content used as embed input
+const DEFAULT_TASK_QUERY = 'test failure error exception crash build failed';
 
 const TEST_SUMMARY_MARKERS = [
   /={3,} (?:short test summary info|FAILURES|ERRORS) ={3,}/i, // pytest
@@ -284,6 +296,35 @@ function splitIntoSections(log: string): LogSection[] {
 }
 
 /**
+ * Rank log sections by semantic similarity to a query.
+ * Returns the original array reference unchanged on any embed failure — callers use
+ * identity comparison (`ranked !== sections`) to detect the fallback path.
+ */
+async function rankSectionsBySimilarity(
+  sections: LogSection[],
+  query: string,
+): Promise<LogSection[]> {
+  let queryVec: number[];
+  try {
+    ({ vector: queryVec } = await embedText(query));
+  } catch {
+    return sections; // no embedding model loaded — fall back silently
+  }
+  const scored: Array<{ section: LogSection; score: number }> = [];
+  for (const section of sections) {
+    try {
+      const snippet = `${section.name}\n${section.content.slice(0, SEMANTIC_SECTION_SNIPPET)}`;
+      const { vector } = await embedText(snippet);
+      scored.push({ section, score: cosineSimilarity(queryVec, vector) });
+    } catch {
+      scored.push({ section, score: 0 }); // failed to embed — rank last
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((s) => s.section);
+}
+
+/**
  * Validate that a log_file path is safe to read: must be absolute and under the system
  * temp directory (or /tmp as a fallback) to prevent arbitrary file reads.
  */
@@ -302,7 +343,7 @@ export async function handleCiLogs(
   ctx: ForkContext,
   progressToken?: string | number,
 ): Promise<ToolResult> {
-  const { repo, run_id, job_id, workflow, branch, filter, context_lines, debug = false, log_file } = args as {
+  const { repo, run_id, job_id, workflow, branch, filter, context_lines, debug = false, log_file, task } = args as {
     repo?: string;
     run_id?: string;
     job_id?: string;
@@ -312,6 +353,7 @@ export async function handleCiLogs(
     context_lines?: number;
     debug?: boolean;
     log_file?: string;
+    task?: string;
   };
 
   if (run_id && !SAFE_RUN_ID.test(run_id))
@@ -355,13 +397,24 @@ export async function handleCiLogs(
     let assembled: string;
     let totalSteps: number;
     if (logSections.length > 0) {
-      const perSectionBudget = Math.max(10_000, Math.floor(MAX_LOG_BUDGET / logSections.length));
-      totalSteps = logSections.length;
-      assembled = logSections
+      let rankedSections = logSections;
+      if (logSections.length > SEMANTIC_RANKING_THRESHOLD) {
+        const query = task ?? DEFAULT_TASK_QUERY;
+        const ranked = await rankSectionsBySimilarity(logSections, query);
+        if (ranked !== logSections) {          // ranking succeeded (not fallback)
+          rankedSections = ranked.slice(0, SEMANTIC_TOP_K);
+        }
+      }
+      const perSectionBudget = Math.max(10_000, Math.floor(MAX_LOG_BUDGET / rankedSections.length));
+      totalSteps = logSections.length;         // keep original count for footer
+      assembled = rankedSections
         .map((s) => `##[group]${s.name}\n${applyCharBudget(s.content, perSectionBudget)}`)
         .join('\n\n');
       // Per-section budget floors at 10K so many sections can exceed MAX_LOG_BUDGET total — cap it.
       assembled = applyCharBudget(assembled, MAX_LOG_BUDGET);
+      if (rankedSections.length < logSections.length) {
+        assembled = `(${rankedSections.length} of ${logSections.length} sections — ranked by: "${task ?? DEFAULT_TASK_QUERY}")\n\n` + assembled;
+      }
     } else {
       totalSteps = 1;
       const groupFiltered = filterByGroup(cleanLog, filterRe);
